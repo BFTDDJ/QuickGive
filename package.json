@@ -1,0 +1,31 @@
+{
+  "name": "dono-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "rotate-jwt": "node scripts/rotate-jwt-secrets.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@sentry/node": "^8.55.0",
+    "@sentry/tracing": "^7.120.0",
+    "@supabase/supabase-js": "^2.94.1",
+    "bcryptjs": "^3.0.2",
+    "body-parser": "^2.2.2",
+    "cors": "^2.8.6",
+    "dd-trace": "^4.47.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.4.0",
+    "jsonwebtoken": "^9.0.2",
+    "pdfkit": "^0.17.2",
+    "pg": "^8.18.0",
+    "resend": "^6.9.1",
+    "stripe": "^20.3.0"
+  }
+}
