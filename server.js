@@ -8,10 +8,13 @@ const cors = require("cors");
 const Stripe = require("stripe");
 const PDFDocument = require("pdfkit");
 const { generateReceiptPdf } = require("./receiptPdf");
+const { sendPasswordResetEmail } = require("./email");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const Sentry = require("@sentry/node");
+const { OAuth2Client } = require("google-auth-library");
+const { createRemoteJWKSet, jwtVerify } = require("jose");
 
 let ddTracer = null;
 if (process.env.DD_TRACE_ENABLED === "true") {
@@ -25,6 +28,10 @@ if (process.env.DD_TRACE_ENABLED === "true") {
 
 const app = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const appleJwks = createRemoteJWKSet(
+  new URL("https://appleid.apple.com/auth/keys")
+);
 
 const metrics = {
   startedAt: Date.now(),
@@ -61,6 +68,26 @@ if (!process.env.JWT_SECRET_CURRENT) {
   logError("JWT_SECRET_CURRENT MISSING");
   process.exit(1);
 }
+if (!process.env.FRONTEND_RESET_URL_BASE) {
+  logError("FRONTEND_RESET_URL_BASE MISSING");
+  process.exit(1);
+}
+if (!process.env.RESEND_API_KEY) {
+  logError("RESEND_API_KEY MISSING");
+  process.exit(1);
+}
+if (!process.env.FROM_EMAIL) {
+  logError("FROM_EMAIL MISSING");
+  process.exit(1);
+}
+if (!process.env.GOOGLE_CLIENT_ID) {
+  logError("GOOGLE_CLIENT_ID MISSING");
+  process.exit(1);
+}
+if (!process.env.APPLE_CLIENT_ID) {
+  logError("APPLE_CLIENT_ID MISSING");
+  process.exit(1);
+}
 db.query("SELECT 1")
   .then(() => {
     logInfo("DB CONNECTION OK");
@@ -78,6 +105,7 @@ async function initUsersTable() {
       email text UNIQUE,
       password_hash text,
       full_name text,
+      stripe_customer_id text,
       created_at timestamptz DEFAULT now()
     )
     `
@@ -88,6 +116,8 @@ async function initUsersTable() {
       ADD COLUMN IF NOT EXISTS email text,
       ADD COLUMN IF NOT EXISTS password_hash text,
       ADD COLUMN IF NOT EXISTS full_name text,
+      ADD COLUMN IF NOT EXISTS apple_sub text,
+      ADD COLUMN IF NOT EXISTS stripe_customer_id text,
       ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now()
     `
   );
@@ -95,6 +125,18 @@ async function initUsersTable() {
     `
     CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique
     ON users (email)
+    `
+  );
+  await db.query(
+    `
+    CREATE UNIQUE INDEX IF NOT EXISTS users_apple_sub_unique
+    ON users (apple_sub)
+    `
+  );
+  await db.query(
+    `
+    CREATE UNIQUE INDEX IF NOT EXISTS users_stripe_customer_unique
+    ON users (stripe_customer_id)
     `
   );
 }
@@ -125,6 +167,7 @@ function authRequired(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) {
+    logError("AUTH FAILURE", { reason: "missing_token", request_id: req.id });
     return res.status(401).json({ error: "Missing token" });
   }
   try {
@@ -132,6 +175,7 @@ function authRequired(req, res, next) {
     req.user = { id: payload.sub, email: payload.email };
     return next();
   } catch (err) {
+    logError("AUTH FAILURE", { reason: "invalid_token", request_id: req.id });
     return res.status(401).json({ error: "Invalid token" });
   }
 }
@@ -163,6 +207,53 @@ function resolveDonorId(req) {
     req.body?.user_id ||
     null
   );
+}
+
+async function getOrCreateStripeCustomer({ donorId, email, userId }) {
+  if (userId) {
+    const { rows } = await db.query(
+      `SELECT stripe_customer_id FROM users WHERE id = $1`,
+      [userId]
+    );
+    const existing = rows[0]?.stripe_customer_id;
+    if (existing) return existing;
+  } else {
+    const { rows } = await db.query(
+      `SELECT stripe_customer_id FROM donor_stripe_customers WHERE donor_id = $1`,
+      [donorId]
+    );
+    const existing = rows[0]?.stripe_customer_id;
+    if (existing) return existing;
+  }
+
+  const customer = await stripe.customers.create({
+    email: email || undefined,
+    metadata: { donor_id: donorId }
+  });
+
+  if (userId) {
+    await db.query(
+      `UPDATE users SET stripe_customer_id = $1 WHERE id = $2`,
+      [customer.id, userId]
+    );
+  } else {
+    await db.query(
+      `
+      INSERT INTO donor_stripe_customers (donor_id, stripe_customer_id)
+      VALUES ($1, $2)
+      ON CONFLICT (donor_id) DO NOTHING
+      `,
+      [donorId, customer.id]
+    );
+  }
+
+  return customer.id;
+}
+
+async function getDefaultPaymentMethod(customerId) {
+  const customer = await stripe.customers.retrieve(customerId);
+  const defaultPm = customer?.invoice_settings?.default_payment_method;
+  return defaultPm || null;
 }
 
 // Allow your iOS app to call this endpoint (for demo use *)
@@ -233,6 +324,30 @@ app.use((req, res, next) => {
   return jsonParser(req, res, next);
 });
 
+app.get("/", (req, res) => {
+  res.status(200).json({
+    service: "QuickGive API",
+    status: "running",
+    environment: process.env.NODE_ENV || "production",
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get("/health", async (req, res) => {
+  try {
+    res.status(200).json({
+      status: "ok",
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 app.post("/auth/signup", authLimiter, async (req, res) => {
   try {
     const { email, password, fullName } = req.body || {};
@@ -290,13 +405,13 @@ app.post("/auth/signin", authLimiter, async (req, res) => {
     const user = rows[0];
     if (!user || !user.password_hash) {
       console.log("AUTH SIGNIN NO USER", { email });
-      return res.status(401).json({ error: "Invalid credentials" });
+      return res.status(401).json({ error: "invalid_credentials" });
     }
 
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) {
       console.log("AUTH SIGNIN BAD PASSWORD", { email });
-      return res.status(401).json({ error: "Invalid credentials" });
+      return res.status(401).json({ error: "invalid_credentials" });
     }
 
     console.log("AUTH SIGNIN OK", { userId: user.id, email: user.email });
@@ -308,7 +423,453 @@ app.post("/auth/signin", authLimiter, async (req, res) => {
   }
 });
 
-app.post("/create-payment-intent", authOptional, async (req, res) => {
+app.post("/auth/google", authLimiter, async (req, res) => {
+  try {
+    const { idToken, fullName } = req.body || {};
+    if (!idToken) {
+      return res.status(400).json({ error: "Missing idToken" });
+    }
+
+    let ticket;
+    try {
+      ticket = await googleClient.verifyIdToken({
+        idToken,
+        audience: process.env.GOOGLE_CLIENT_ID
+      });
+    } catch (err) {
+      logError("GOOGLE TOKEN VERIFY FAILED", { error: err.message });
+      return res.status(401).json({ error: "Invalid Google token" });
+    }
+
+    const payload = ticket.getPayload();
+    const email = payload?.email;
+    if (!email) {
+      return res.status(400).json({ error: "Missing email from Google" });
+    }
+
+    const existing = await db.query(
+      `SELECT id, email FROM users WHERE email = $1 LIMIT 1`,
+      [email]
+    );
+
+    let userId;
+    if (existing.rowCount > 0) {
+      userId = existing.rows[0].id;
+    } else {
+      userId = randomUUID();
+      await db.query(
+        `
+        INSERT INTO users (id, email, full_name)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (email) DO NOTHING
+        `,
+        [userId, email, fullName || payload?.name || null]
+      );
+    }
+
+    const token = signToken(userId, email);
+    return res.json({ userId, email, token });
+  } catch (err) {
+    logError("AUTH GOOGLE FAILED", { error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/auth/apple", authLimiter, async (req, res) => {
+  try {
+    const { idToken, fullName } = req.body || {};
+    if (!idToken) {
+      return res.status(400).json({ error: "Missing idToken" });
+    }
+
+    let payload;
+    try {
+      const result = await jwtVerify(idToken, appleJwks, {
+        audience: process.env.APPLE_CLIENT_ID,
+        issuer: "https://appleid.apple.com"
+      });
+      payload = result.payload;
+    } catch (err) {
+      logError("APPLE TOKEN VERIFY FAILED", { error: err.message });
+      return res.status(401).json({ error: "Invalid Apple token" });
+    }
+
+    const appleSub = payload?.sub;
+    const email = payload?.email || null;
+    if (!appleSub) {
+      return res.status(400).json({ error: "Missing apple sub" });
+    }
+
+    let userId;
+    let userEmail = email;
+    const bySub = await db.query(
+      `SELECT id, email FROM users WHERE apple_sub = $1 LIMIT 1`,
+      [appleSub]
+    );
+    if (bySub.rowCount > 0) {
+      userId = bySub.rows[0].id;
+      userEmail = bySub.rows[0].email;
+    } else if (email) {
+      const byEmail = await db.query(
+        `SELECT id, email FROM users WHERE email = $1 LIMIT 1`,
+        [email]
+      );
+      if (byEmail.rowCount > 0) {
+        userId = byEmail.rows[0].id;
+        userEmail = byEmail.rows[0].email;
+        await db.query(`UPDATE users SET apple_sub = $1 WHERE id = $2`, [
+          appleSub,
+          userId
+        ]);
+      } else {
+        userId = randomUUID();
+        await db.query(
+          `
+          INSERT INTO users (id, email, full_name, apple_sub)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (apple_sub) DO NOTHING
+          `,
+          [userId, email, fullName || null, appleSub]
+        );
+      }
+    } else {
+      return res.status(400).json({ error: "Email not provided by Apple" });
+    }
+
+    const token = signToken(userId, userEmail);
+    return res.json({ userId, email: userEmail, token });
+  } catch (err) {
+    logError("AUTH APPLE FAILED", { error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/auth/forgot-password", authLimiter, async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email) {
+      return res.status(400).json({ error: "Missing email" });
+    }
+
+    const { rows } = await db.query(
+      `SELECT id, email FROM users WHERE email = $1`,
+      [email]
+    );
+    const user = rows[0];
+
+    if (user) {
+      const token = require("crypto").randomBytes(32).toString("hex");
+      const tokenHash = require("crypto")
+        .createHash("sha256")
+        .update(token)
+        .digest("hex");
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+      await db.query(
+        `
+        INSERT INTO password_reset_tokens (
+          id,
+          user_id,
+          token_hash,
+          expires_at
+        )
+        VALUES ($1, $2, $3, $4)
+        `,
+        [randomUUID(), user.id, tokenHash, expiresAt.toISOString()]
+      );
+
+      const baseUrl = process.env.FRONTEND_RESET_URL_BASE;
+      const resetUrl = `${baseUrl}/reset-password?token=${token}`;
+      try {
+        await sendPasswordResetEmail(user.email, resetUrl);
+      } catch (err) {
+        logError("PASSWORD RESET EMAIL FAILED", { error: err.message });
+      }
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    logError("FORGOT PASSWORD FAILED", { error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/auth/reset-password", authLimiter, async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+    if (!token || !newPassword) {
+      return res.status(400).json({ error: "Missing token or password" });
+    }
+
+    const tokenHash = require("crypto")
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const { rows } = await db.query(
+      `
+      SELECT id, user_id, expires_at, used_at
+      FROM password_reset_tokens
+      WHERE token_hash = $1
+      LIMIT 1
+      `,
+      [tokenHash]
+    );
+
+    const record = rows[0];
+    if (!record || record.used_at || new Date(record.expires_at) < new Date()) {
+      return res.status(400).json({ error: "Invalid or expired token" });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+
+    await db.query("BEGIN");
+    await db.query(
+      `
+      UPDATE users
+      SET password_hash = $1
+      WHERE id = $2
+      `,
+      [passwordHash, record.user_id]
+    );
+    await db.query(
+      `
+      UPDATE password_reset_tokens
+      SET used_at = now()
+      WHERE id = $1
+      `,
+      [record.id]
+    );
+    await db.query("COMMIT");
+
+    return res.json({ ok: true });
+  } catch (err) {
+    await db.query("ROLLBACK").catch(() => {});
+    logError("RESET PASSWORD FAILED", { error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/recurring/setup-intent", authRequired, async (req, res) => {
+  try {
+    const donorId = req.user?.id;
+    const email = req.user?.email;
+    if (!email) {
+      logError("AUTH FAILURE", { reason: "missing_email", request_id: req.id });
+      return res.status(400).json({ error: "Missing user email" });
+    }
+    const customerId = await getOrCreateStripeCustomer({
+      donorId,
+      email,
+      userId: req.user?.id || null
+    });
+
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customerId,
+      usage: "off_session"
+    });
+
+    return res.json({
+      client_secret: setupIntent.client_secret,
+      customer_id: customerId
+    });
+  } catch (err) {
+    logError("RECURRING SETUP INTENT FAILED", { error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/recurring", authRequired, async (req, res) => {
+  try {
+    const donorId = req.user?.id;
+    const {
+      charity_id,
+      amount_cents,
+      frequency,
+      start_date,
+      end_date,
+      currency
+    } = req.body || {};
+
+    if (!donorId || !charity_id || !amount_cents || amount_cents <= 0) {
+      return res.status(400).json({ error: "Missing or invalid fields" });
+    }
+    if (!req.user?.email) {
+      logError("AUTH FAILURE", { reason: "missing_email", request_id: req.id });
+      return res.status(400).json({ error: "Missing user email" });
+    }
+    if (!["weekly", "monthly"].includes(frequency)) {
+      return res.status(400).json({ error: "Invalid frequency" });
+    }
+
+    const startDate = new Date(start_date);
+    if (Number.isNaN(startDate.getTime())) {
+      return res.status(400).json({ error: "Invalid start_date" });
+    }
+    let endDate = null;
+    if (end_date) {
+      endDate = new Date(end_date);
+      if (Number.isNaN(endDate.getTime())) {
+        return res.status(400).json({ error: "Invalid end_date" });
+      }
+      if (endDate < startDate) {
+        return res.status(400).json({ error: "end_date must be >= start_date" });
+      }
+    }
+
+    const customerId = await getOrCreateStripeCustomer({
+      donorId,
+      email: req.user.email,
+      userId: req.user?.id || null
+    });
+
+    const defaultPaymentMethod = await getDefaultPaymentMethod(customerId);
+    if (!defaultPaymentMethod) {
+      return res
+        .status(400)
+        .json({ error: "No default payment method on customer" });
+    }
+
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const startUnix = Math.floor(startDate.getTime() / 1000);
+    const cancelAtUnix = endDate ? Math.floor(endDate.getTime() / 1000) : null;
+
+    const subscriptionCurrency = currency || "usd";
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [
+        {
+          price_data: {
+            currency: subscriptionCurrency,
+            unit_amount: amount_cents,
+            recurring: { interval: frequency }
+          }
+        }
+      ],
+      metadata: {
+        donor_id: donorId,
+        charity_id,
+        email: req.user.email || ""
+      },
+      collection_method: "charge_automatically",
+      default_payment_method: defaultPaymentMethod,
+      ...(startUnix > nowUnix ? { trial_end: startUnix } : {}),
+      ...(cancelAtUnix ? { cancel_at: cancelAtUnix } : {})
+    });
+
+    const { rows } = await db.query(
+      `
+      INSERT INTO recurring_schedules (
+        id,
+        donor_id,
+        user_id,
+        charity_id,
+        frequency,
+        amount_cents,
+        currency,
+        start_date,
+        end_date,
+        stripe_customer_id,
+        stripe_subscription_id,
+        status
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      RETURNING *
+      `,
+      [
+        randomUUID(),
+        donorId,
+        req.user?.id || donorId,
+        charity_id,
+        frequency,
+        amount_cents,
+        subscriptionCurrency,
+        startDate.toISOString(),
+        endDate ? endDate.toISOString() : null,
+        customerId,
+        subscription.id,
+        "active"
+      ]
+    );
+
+    return res.json(rows[0]);
+  } catch (err) {
+    logError("RECURRING CREATE FAILED", { error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/recurring", authOptional, async (req, res) => {
+  try {
+    const donorId = resolveDonorId(req);
+    if (!donorId) {
+      return res.status(400).json({ error: "Missing donor_id" });
+    }
+    const { rows } = await db.query(
+      `
+      SELECT *
+      FROM recurring_schedules
+      WHERE donor_id = $1
+      ORDER BY created_at DESC
+      `,
+      [donorId]
+    );
+    return res.json(rows);
+  } catch (err) {
+    logError("RECURRING LIST FAILED", { error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/recurring/:id/cancel", authRequired, async (req, res) => {
+  try {
+    const donorId = req.user?.id;
+    const { rows } = await db.query(
+      `
+      SELECT *
+      FROM recurring_schedules
+      WHERE id = $1 AND donor_id = $2
+      LIMIT 1
+      `,
+      [req.params.id, donorId]
+    );
+    const schedule = rows[0];
+    if (!schedule) {
+      return res.status(404).json({ error: "Schedule not found" });
+    }
+
+    const cancelAtPeriodEnd = req.body?.cancel_at_period_end === true;
+    let updated;
+    if (cancelAtPeriodEnd) {
+      updated = await stripe.subscriptions.update(
+        schedule.stripe_subscription_id,
+        { cancel_at_period_end: true }
+      );
+    } else {
+      updated = await stripe.subscriptions.del(
+        schedule.stripe_subscription_id
+      );
+    }
+
+    const { rows: updatedRows } = await db.query(
+      `
+      UPDATE recurring_schedules
+      SET status = $1,
+          canceled_at = now()
+      WHERE id = $2
+      RETURNING *
+      `,
+      [cancelAtPeriodEnd ? "canceled" : "ended", schedule.id]
+    );
+
+    return res.json(updatedRows[0]);
+  } catch (err) {
+    logError("RECURRING CANCEL FAILED", { error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/create-payment-intent", authRequired, async (req, res) => {
   try {
     const { amount, currency = "usd", charity_id, user_id, email } = req.body;
 
@@ -319,15 +880,20 @@ app.post("/create-payment-intent", authOptional, async (req, res) => {
       return res.status(400).json({ error: "Missing charity_id" });
     }
 
-    const donorId = resolveDonorId(req);
+    const donorId = req.user?.id;
+    const userEmail = req.user?.email;
+    if (!userEmail) {
+      logError("AUTH FAILURE", { reason: "missing_email", request_id: req.id });
+      return res.status(400).json({ error: "Missing user email" });
+    }
     const paymentIntent = await stripe.paymentIntents.create({
       amount, // cents
       currency,
       automatic_payment_methods: { enabled: true },
       metadata: {
         charity_id,
-        user_id: donorId ?? user_id ?? undefined,
-        email,
+        user_id: donorId,
+        email: userEmail,
         app: "Dono"
       }
     });
@@ -355,26 +921,30 @@ app.post("/stripe/webhook", (req, res) => {
     return res.status(400).send("Webhook Error");
   }
 
-  if (event.type !== "payment_intent.succeeded") {
-    logInfo("WEBHOOK IGNORED", {
-      request_id: req.id,
-      event_type: event.type
-    });
-    return res.json({ received: true });
-  }
+  logInfo("WEBHOOK EVENT", { request_id: req.id, event_type: event.type, event_id: event.id });
 
-  const paymentIntent = event.data?.object;
-  if (!paymentIntent || !paymentIntent.id) {
-    metrics.paymentFailures += 1;
-    logError("INVALID PAYMENT INTENT DATA", { request_id: req.id });
-    return res.json({ received: true });
-  }
+  if (event.type === "payment_intent.succeeded") {
+    const paymentIntent = event.data?.object;
+    if (!paymentIntent || !paymentIntent.id) {
+      metrics.paymentFailures += 1;
+      logError("INVALID PAYMENT INTENT DATA", { request_id: req.id });
+      return res.json({ received: true });
+    }
 
-  const donorId = paymentIntent.metadata?.user_id || randomUUID();
+  const donorId = paymentIntent.metadata?.user_id || null;
   const donorEmail = paymentIntent.metadata?.email || null;
   const charityId = paymentIntent.metadata?.charity_id;
   const amountReceived = paymentIntent.amount_received;
   const currency = paymentIntent.currency || "usd";
+
+  if (!donorId || !donorEmail) {
+    logError("AUTH FAILURE", {
+      reason: "missing_user_identity",
+      request_id: req.id,
+      stripe_payment_intent_id: paymentIntent.id
+    });
+    return res.json({ received: true });
+  }
 
   if (!charityId || !amountReceived || amountReceived <= 0) {
     metrics.paymentFailures += 1;
@@ -382,159 +952,315 @@ app.post("/stripe/webhook", (req, res) => {
       request_id: req.id,
       stripe_payment_intent_id: paymentIntent.id,
       donor_id: donorId,
+        amount: amountReceived,
+        charity_id: charityId
+      });
+      return res.json({ received: true });
+    }
+
+    logInfo("WEBHOOK RECEIVED", {
+      request_id: req.id,
+      stripe_payment_intent_id: paymentIntent.id,
+      donor_id: donorId,
       amount: amountReceived,
       charity_id: charityId
     });
-    return res.json({ received: true });
-  }
 
-  logInfo("WEBHOOK RECEIVED", {
-    request_id: req.id,
-    stripe_payment_intent_id: paymentIntent.id,
-    donor_id: donorId,
-    amount: amountReceived,
-    charity_id: charityId
-  });
+    const donation = {
+      id: randomUUID(),
+      amount: amountReceived / 100,
+      currency,
+      charityId,
+      donorId,
+      paymentIntentId: paymentIntent.id,
+      createdAt: new Date().toISOString()
+    };
 
-  const donation = {
-    id: randomUUID(),
-    amount: amountReceived / 100,
-    currency,
-    charityId,
-    donorId,
-    paymentIntentId: paymentIntent.id,
-    createdAt: new Date().toISOString()
-  };
+    const receipt = {
+      id: randomUUID(),
+      donationId: donation.id
+    };
 
-  const receipt = {
-    id: randomUUID(),
-    donationId: donation.id
-  };
+    (async () => {
+      try {
+        const userCheck = await db.query(
+          `SELECT 1 FROM users WHERE id = $1 LIMIT 1`,
+          [donation.donorId]
+        );
+        if (userCheck.rowCount === 0) {
+          logError("USER NOT FOUND FOR DONATION", {
+            request_id: req.id,
+            donor_id: donation.donorId,
+            stripe_payment_intent_id: donation.paymentIntentId
+          });
+          return;
+        }
 
-  (async () => {
-    try {
-      if (donorEmail) {
+        const donationInsert = await db.query(
+          `
+          INSERT INTO donations (
+            id,
+            amount_cents,
+            currency,
+            charity_id,
+            user_id,
+            stripe_payment_intent_id,
+            created_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          ON CONFLICT (stripe_payment_intent_id) DO NOTHING
+          RETURNING id
+          `,
+          [
+            donation.id,
+            amountReceived,
+            donation.currency,
+            donation.charityId,
+            donation.donorId,
+            donation.paymentIntentId,
+            donation.createdAt
+          ]
+        );
+
+        if (donationInsert.rowCount === 0) {
+          logInfo("DUPLICATE PAYMENT INTENT IGNORED", {
+            request_id: req.id,
+            stripe_payment_intent_id: donation.paymentIntentId,
+            donor_id: donation.donorId,
+            amount: amountReceived,
+            charity_id: charityId
+          });
+          return;
+        }
+
         await db.query(
           `
-          INSERT INTO users (id, email)
-          VALUES ($1, $2)
-          ON CONFLICT (id) DO NOTHING
+          INSERT INTO receipts (
+            id,
+            donation_id,
+            created_at
+          )
+          VALUES ($1, $2, $3)
+          ON CONFLICT (donation_id) DO NOTHING
           `,
-          [donation.donorId, donorEmail]
+          [receipt.id, receipt.donationId, new Date().toISOString()]
         );
-      } else {
-        console.log("SKIP USER INSERT (NO EMAIL)", { donor_id: donation.donorId });
-      }
 
-      const donationInsert = await db.query(
-        `
-        INSERT INTO donations (
-          id,
-          amount_cents,
-          currency,
-          charity_id,
-          user_id,
-          stripe_payment_intent_id,
-          created_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (stripe_payment_intent_id) DO NOTHING
-        RETURNING id
-        `,
-        [
-          donation.id,
-          amountReceived,
-          donation.currency,
-          donation.charityId,
-          donation.donorId,
-          donation.paymentIntentId,
-          donation.createdAt
-        ]
-      );
+        try {
+          const receiptForPdf = {
+            id: receipt.id,
+            donationId: receipt.donationId,
+            createdAt: new Date().toISOString(),
+            taxDeductible: true
+          };
 
-      if (donationInsert.rowCount === 0) {
-        logInfo("DUPLICATE PAYMENT INTENT IGNORED", {
-          request_id: req.id,
-          stripe_payment_intent_id: donation.paymentIntentId,
-          donor_id: donation.donorId,
-          amount: amountReceived,
-          charity_id: charityId
-        });
-        return;
-      }
+          let pdfBuffer = await generateReceiptPdf(receiptForPdf, donation);
+          const storagePath = `receipts/${receipt.id}.pdf`;
 
-      await db.query(
-        `
-        INSERT INTO receipts (
-          id,
-          donation_id,
-          created_at
-        )
-        VALUES ($1, $2, $3)
-        ON CONFLICT (donation_id) DO NOTHING
-        `,
-        [receipt.id, receipt.donationId, new Date().toISOString()]
-      );
-
-      try {
-        const receiptForPdf = {
-          id: receipt.id,
-          donationId: receipt.donationId,
-          createdAt: new Date().toISOString(),
-          taxDeductible: true
-        };
-
-        let pdfBuffer = await generateReceiptPdf(receiptForPdf, donation);
-        const storagePath = `receipts/${receipt.id}.pdf`;
-
-        const uploadResult = await supabase.storage
-          .from("receipts")
-          .upload(storagePath, pdfBuffer, {
-            contentType: "application/pdf",
-            upsert: true
-          });
-
-        pdfBuffer = null;
-
-        if (uploadResult.error) {
-          console.error("RECEIPT PDF UPLOAD FAILED:", uploadResult.error);
-        } else {
-          const signed = await supabase.storage
+          const uploadResult = await supabase.storage
             .from("receipts")
-            .createSignedUrl(storagePath, 600);
+            .upload(storagePath, pdfBuffer, {
+              contentType: "application/pdf",
+              upsert: true
+            });
 
-          if (signed.error) {
-            console.error("RECEIPT SIGNED URL FAILED:", signed.error);
-          } else if (signed.data?.signedUrl) {
-            await db.query(
-              `
-              UPDATE receipts
-              SET pdf_url = $1
-              WHERE id = $2
-              `,
-              [signed.data.signedUrl, receipt.id]
-            );
+          pdfBuffer = null;
+
+          if (uploadResult.error) {
+            console.error("RECEIPT PDF UPLOAD FAILED:", uploadResult.error);
+          } else {
+            const signed = await supabase.storage
+              .from("receipts")
+              .createSignedUrl(storagePath, 600);
+
+            if (signed.error) {
+              console.error("RECEIPT SIGNED URL FAILED:", signed.error);
+            } else if (signed.data?.signedUrl) {
+              await db.query(
+                `
+                UPDATE receipts
+                SET pdf_url = $1
+                WHERE id = $2
+                `,
+                [signed.data.signedUrl, receipt.id]
+              );
+            }
           }
+        } catch (err) {
+          console.error("RECEIPT PDF PROCESS FAILED:", err);
         }
-      } catch (err) {
-        console.error("RECEIPT PDF PROCESS FAILED:", err);
-      }
 
-      logInfo("DONATION AND RECEIPT SAVED TO DB", {
-        request_id: req.id,
-        donation_id: donation.id,
-        donor_id: donation.donorId,
-        stripe_payment_intent_id: donation.paymentIntentId
-      });
-    } catch (err) {
-      logError("DB SAVE FAILED", {
-        request_id: req.id,
-        donor_id: donation.donorId,
-        stripe_payment_intent_id: donation.paymentIntentId,
-        error: err.message
-      });
+        logInfo("DONATION AND RECEIPT SAVED TO DB", {
+          request_id: req.id,
+          donation_id: donation.id,
+          donor_id: donation.donorId,
+          stripe_payment_intent_id: donation.paymentIntentId
+        });
+      } catch (err) {
+        logError("DB SAVE FAILED", {
+          request_id: req.id,
+          donor_id: donation.donorId,
+          stripe_payment_intent_id: donation.paymentIntentId,
+          error: err.message
+        });
+      }
+    })();
+  } else if (event.type === "invoice.paid") {
+    const invoice = event.data?.object;
+    if (!invoice || !invoice.id || !invoice.subscription) {
+      logError("INVALID INVOICE DATA", { request_id: req.id });
+      return res.json({ received: true });
     }
-  })();
+
+    (async () => {
+      try {
+        const { rows } = await db.query(
+          `
+          SELECT * FROM recurring_schedules
+          WHERE stripe_subscription_id = $1
+          LIMIT 1
+          `,
+          [invoice.subscription]
+        );
+        const schedule = rows[0];
+        if (!schedule) {
+          logInfo("INVOICE WITH NO SCHEDULE", { invoice_id: invoice.id });
+          return;
+        }
+
+        if (
+          schedule.end_date &&
+          invoice.created * 1000 >= new Date(schedule.end_date).getTime()
+        ) {
+          logInfo("INVOICE AFTER END DATE IGNORED", {
+            invoice_id: invoice.id,
+            schedule_id: schedule.id
+          });
+          return;
+        }
+
+        const existing = await db.query(
+          `SELECT 1 FROM recurring_donations WHERE invoice_id = $1`,
+          [invoice.id]
+        );
+        if (existing.rowCount > 0) {
+          return;
+        }
+
+        const donationId = randomUUID();
+        const stripePaymentIntentId = invoice.payment_intent || invoice.id;
+
+        const donationInsert = await db.query(
+          `
+          INSERT INTO donations (
+            id,
+            amount_cents,
+            currency,
+            charity_id,
+            user_id,
+            stripe_payment_intent_id,
+            created_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, now())
+          ON CONFLICT (stripe_payment_intent_id) DO NOTHING
+          RETURNING id
+          `,
+          [
+            donationId,
+            invoice.amount_paid,
+            invoice.currency,
+            schedule.charity_id,
+            schedule.user_id,
+            stripePaymentIntentId
+          ]
+        );
+
+        await db.query(
+          `
+          INSERT INTO recurring_donations (
+            id,
+            schedule_id,
+            donation_id,
+            invoice_id,
+            created_at
+          )
+          VALUES ($1, $2, $3, $4, now())
+          ON CONFLICT (invoice_id) DO NOTHING
+          `,
+          [randomUUID(), schedule.id, donationId, invoice.id]
+        );
+
+        logInfo("RECURRING INVOICE PAID", {
+          invoice_id: invoice.id,
+          schedule_id: schedule.id,
+          donation_id: donationInsert.rows[0]?.id || null
+        });
+      } catch (err) {
+        logError("RECURRING INVOICE FAILED", { error: err.message });
+      }
+    })();
+  } else if (event.type === "customer.subscription.deleted") {
+    const subscription = event.data?.object;
+    if (!subscription || !subscription.id) {
+      logError("INVALID SUBSCRIPTION DATA", { request_id: req.id });
+      return res.json({ received: true });
+    }
+    (async () => {
+      try {
+        await db.query(
+          `
+          UPDATE recurring_schedules
+          SET status = 'ended', canceled_at = now()
+          WHERE stripe_subscription_id = $1
+          `,
+          [subscription.id]
+        );
+      } catch (err) {
+        logError("SUBSCRIPTION DELETE SYNC FAILED", {
+          request_id: req.id,
+          error: err.message
+        });
+      }
+    })();
+  } else if (event.type === "customer.subscription.updated") {
+    const subscription = event.data?.object;
+    if (!subscription || !subscription.id) {
+      logError("INVALID SUBSCRIPTION DATA", { request_id: req.id });
+      return res.json({ received: true });
+    }
+    const status =
+      subscription.status === "canceled"
+        ? "ended"
+        : subscription.cancel_at_period_end
+        ? "canceled"
+        : "active";
+    (async () => {
+      try {
+        await db.query(
+          `
+          UPDATE recurring_schedules
+          SET status = $1,
+              end_date = CASE
+                WHEN $2 IS NULL THEN end_date
+                ELSE to_timestamp($2)
+              END
+          WHERE stripe_subscription_id = $3
+          `,
+          [status, subscription.cancel_at, subscription.id]
+        );
+      } catch (err) {
+        logError("SUBSCRIPTION UPDATE SYNC FAILED", {
+          request_id: req.id,
+          error: err.message
+        });
+      }
+    })();
+  } else {
+    logInfo("WEBHOOK IGNORED", {
+      request_id: req.id,
+      event_type: event.type
+    });
+  }
 
   res.json({ received: true });
 });
@@ -759,6 +1485,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-app.listen(process.env.PORT || 4242, () => {
-  console.log(`Server running on port ${process.env.PORT || 4242}`);
+const port = process.env.PORT || 4242;
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Server running on port ${port}`);
 });

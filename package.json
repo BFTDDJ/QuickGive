@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "rotate-jwt": "node scripts/rotate-jwt-secrets.js"
+    "rotate-jwt": "node scripts/rotate-jwt-secrets.js",
+    "smoke:prod": "bash ./scripts/smoke-prod.sh"
   },
   "keywords": [],
   "author": "",
@@ -22,6 +23,8 @@
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "express-rate-limit": "^7.4.0",
+    "google-auth-library": "^9.15.1",
+    "jose": "^5.10.0",
     "jsonwebtoken": "^9.0.2",
     "pdfkit": "^0.17.2",
     "pg": "^8.18.0",

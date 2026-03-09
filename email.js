@@ -45,3 +45,26 @@ async function sendReceiptEmail(toEmail, receipt, donation) {
 }
 
 module.exports = { sendReceiptEmail };
+
+async function sendPasswordResetEmail(toEmail, resetUrl) {
+  const response = await resend.emails.send({
+    from: process.env.FROM_EMAIL,
+    to: toEmail,
+    subject: "Reset your Dono password",
+    html: `
+      <h2>Reset your password</h2>
+      <p>Click the link below to reset your password:</p>
+      <p><a href="${resetUrl}">${resetUrl}</a></p>
+      <p>If you did not request this, you can ignore this email.</p>
+    `
+  });
+
+  if (response?.error) {
+    throw response.error;
+  }
+
+  console.log("PASSWORD RESET EMAIL SENT TO:", toEmail);
+  return response;
+}
+
+module.exports.sendPasswordResetEmail = sendPasswordResetEmail;
