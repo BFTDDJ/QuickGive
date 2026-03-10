@@ -734,6 +734,56 @@ app.get("/health", async (req, res) => {
   }
 });
 
+app.get("/ready", async (req, res) => {
+  const missingEnv = [
+    "DATABASE_URL",
+    "STRIPE_SECRET_KEY",
+    "STRIPE_WEBHOOK_SECRET",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "JWT_SECRET_CURRENT"
+  ].filter((key) => !process.env[key]);
+
+  if (missingEnv.length > 0) {
+    return res.status(503).json({
+      status: "not_ready",
+      checks: {
+        env: {
+          ok: false,
+          missing: missingEnv
+        }
+      },
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  try {
+    await db.query("SELECT 1");
+    return res.status(200).json({
+      status: "ready",
+      checks: {
+        env: { ok: true },
+        db: { ok: true },
+        stripe: { configured: true },
+        supabase: { configured: true }
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    return res.status(503).json({
+      status: "not_ready",
+      checks: {
+        env: { ok: true },
+        db: {
+          ok: false,
+          error: err.message
+        }
+      },
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
 app.post("/auth/signup", authLimiter, async (req, res) => {
   try {
     const { email, password, fullName } = req.body || {};
