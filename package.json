@@ -6,6 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "rotate-jwt": "node scripts/rotate-jwt-secrets.js",
+    "rotate-jwt:write": "node scripts/rotate-jwt-secrets.js --write",
     "smoke:prod": "bash ./scripts/smoke-prod.sh"
   },
   "keywords": [],

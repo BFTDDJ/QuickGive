@@ -1,58 +1,109 @@
 #!/usr/bin/env node
 
 const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
 
-const envPath = process.argv[2] || ".env";
-if (!fs.existsSync(envPath)) {
-  console.error(`.env not found at ${envPath}`);
-  process.exit(1);
+const args = new Set(process.argv.slice(2));
+const shouldWrite = args.has("--write");
+const envFileArg = process.argv.find((arg) => arg.startsWith("--env-file="));
+const envFilePath = path.resolve(
+  process.cwd(),
+  envFileArg ? envFileArg.slice("--env-file=".length) : ".env"
+);
+
+function parseEnv(contents) {
+  const values = {};
+
+  for (const line of contents.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) {
+      continue;
+    }
+
+    values[match[1]] = match[2];
+  }
+
+  return values;
 }
 
-const raw = fs.readFileSync(envPath, "utf8");
-const lines = raw.split(/\r?\n/);
+function updateEnvValue(contents, key, value) {
+  const line = `${key}=${value}`;
+  const pattern = new RegExp(`^${key}=.*$`, "m");
 
-function getValue(key) {
-  const line = lines.find((l) => l.startsWith(`${key}=`));
-  if (!line) return null;
-  return line.slice(key.length + 1);
+  if (pattern.test(contents)) {
+    return contents.replace(pattern, line);
+  }
+
+  const suffix = contents.endsWith("\n") ? "" : "\n";
+  return `${contents}${suffix}${line}\n`;
 }
 
-const current = getValue("JWT_SECRET_CURRENT");
+function loadCurrentSecret() {
+  if (process.env.JWT_SECRET_CURRENT) {
+    return {
+      source: "process.env",
+      value: process.env.JWT_SECRET_CURRENT
+    };
+  }
+
+  if (!fs.existsSync(envFilePath)) {
+    return null;
+  }
+
+  const envContents = fs.readFileSync(envFilePath, "utf8");
+  const envValues = parseEnv(envContents);
+
+  if (!envValues.JWT_SECRET_CURRENT) {
+    return null;
+  }
+
+  return {
+    source: envFilePath,
+    value: envValues.JWT_SECRET_CURRENT
+  };
+}
+
+const current = loadCurrentSecret();
+
 if (!current) {
-  console.error("JWT_SECRET_CURRENT is missing; aborting rotation.");
+  console.error("JWT rotation failed: JWT_SECRET_CURRENT was not found in process.env or the env file.");
   process.exit(1);
 }
 
-const newSecret = crypto.randomBytes(48).toString("hex");
-let nextLines = [];
-let hasPrev = false;
-let hasCurrent = false;
+const newCurrent = crypto.randomBytes(48).toString("hex");
 
-for (const line of lines) {
-  if (line.startsWith("JWT_SECRET_PREVIOUS=")) {
-    nextLines.push(`JWT_SECRET_PREVIOUS=${current}`);
-    hasPrev = true;
-    continue;
-  }
-  if (line.startsWith("JWT_SECRET_CURRENT=")) {
-    nextLines.push(`JWT_SECRET_CURRENT=${newSecret}`);
-    hasCurrent = true;
-    continue;
-  }
-  nextLines.push(line);
+console.log("JWT rotation plan");
+console.log("=================");
+console.log(`Current secret source: ${current.source}`);
+console.log("");
+console.log("Set these values in DigitalOcean App Platform:");
+console.log(`JWT_SECRET_PREVIOUS=${current.value}`);
+console.log(`JWT_SECRET_CURRENT=${newCurrent}`);
+console.log("");
+console.log("Then redeploy, wait through the old token TTL, and remove JWT_SECRET_PREVIOUS in a second deploy.");
+
+if (!shouldWrite) {
+  console.log("");
+  console.log("Dry run only. Nothing was written locally.");
+  console.log("Use --write if you intentionally want to update the local env file too.");
+  process.exit(0);
 }
 
-if (!hasPrev) {
-  nextLines.push(`JWT_SECRET_PREVIOUS=${current}`);
-}
-if (!hasCurrent) {
-  nextLines.push(`JWT_SECRET_CURRENT=${newSecret}`);
+if (!fs.existsSync(envFilePath)) {
+  console.error(`JWT rotation failed: env file not found at ${envFilePath}`);
+  process.exit(1);
 }
 
-fs.writeFileSync(envPath, nextLines.join("\n"), "utf8");
+let envContents = fs.readFileSync(envFilePath, "utf8");
+envContents = updateEnvValue(envContents, "JWT_SECRET_PREVIOUS", current.value);
+envContents = updateEnvValue(envContents, "JWT_SECRET_CURRENT", newCurrent);
+fs.writeFileSync(envFilePath, envContents, "utf8");
 
-console.log("JWT secrets rotated.");
-console.log("- JWT_SECRET_PREVIOUS set to old current secret");
-console.log("- JWT_SECRET_CURRENT set to new secret");
-console.log("Reminder: deploy and keep previous until tokens expire.");
+console.log("");
+console.log(`Local env file updated: ${envFilePath}`);
