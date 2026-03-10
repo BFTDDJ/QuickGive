@@ -337,6 +337,71 @@ app.post(
       case "payment_intent.succeeded": {
         const paymentIntent = event.data.object;
         console.log("Payment succeeded:", paymentIntent.id);
+
+        // Respond immediately to Stripe, then persist asynchronously.
+        (async () => {
+          try {
+            const donorId = paymentIntent?.metadata?.user_id || null;
+            const charityId = paymentIntent?.metadata?.charity_id || null;
+            const amountCents = paymentIntent?.amount_received || 0;
+            const currency = paymentIntent?.currency || "usd";
+            const stripePaymentIntentId = paymentIntent?.id || null;
+
+            if (!donorId || !charityId || !stripePaymentIntentId || amountCents <= 0) {
+              logError("WEBHOOK DONATION SKIPPED INVALID DATA", {
+                request_id: req.id,
+                stripe_payment_intent_id: stripePaymentIntentId,
+                donor_id: donorId,
+                charity_id: charityId,
+                amount_cents: amountCents
+              });
+              return;
+            }
+
+            const result = await db.query(
+              `
+              INSERT INTO donations (
+                id,
+                amount_cents,
+                currency,
+                charity_id,
+                user_id,
+                stripe_payment_intent_id,
+                created_at
+              )
+              VALUES ($1, $2, $3, $4, $5, $6, now())
+              ON CONFLICT (stripe_payment_intent_id) DO NOTHING
+              RETURNING id
+              `,
+              [
+                randomUUID(),
+                amountCents,
+                currency,
+                charityId,
+                donorId,
+                stripePaymentIntentId
+              ]
+            );
+
+            if (result.rowCount === 0) {
+              logInfo("DUPLICATE WEBHOOK IGNORED", {
+                request_id: req.id,
+                stripe_payment_intent_id: stripePaymentIntentId
+              });
+            } else {
+              logInfo("DONATION SAVED FROM WEBHOOK", {
+                request_id: req.id,
+                donation_id: result.rows[0].id,
+                stripe_payment_intent_id: stripePaymentIntentId
+              });
+            }
+          } catch (error) {
+            logError("WEBHOOK DONATION PERSIST FAILED", {
+              request_id: req.id,
+              error: error.message
+            });
+          }
+        })();
         break;
       }
       default:
