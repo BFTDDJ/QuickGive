@@ -414,13 +414,14 @@ app.post(
                 INSERT INTO receipts (
                   id,
                   donation_id,
+                  tax_deductible,
                   created_at
                 )
-                VALUES ($1, $2, now())
+                VALUES ($1, $2, $3, now())
                 ON CONFLICT (donation_id) DO NOTHING
                 RETURNING id
                 `,
-                [randomUUID(), donationId]
+                [randomUUID(), donationId, true]
               );
 
               if (receiptInsert.rowCount > 0) {
@@ -429,12 +430,20 @@ app.post(
                   receipt_id: receiptInsert.rows[0].id,
                   donation_id: donationId
                 });
+              } else {
+                logInfo("RECEIPT ALREADY EXISTS FOR DONATION", {
+                  request_id: req.id,
+                  donation_id: donationId
+                });
               }
             }
           } catch (error) {
             logError("WEBHOOK DONATION PERSIST FAILED", {
               request_id: req.id,
-              error: error.message
+              error: error.message,
+              code: error.code || null,
+              detail: error.detail || null,
+              constraint: error.constraint || null
             });
           }
         })();
