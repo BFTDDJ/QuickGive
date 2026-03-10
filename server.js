@@ -256,6 +256,32 @@ async function getDefaultPaymentMethod(customerId) {
   return defaultPm || null;
 }
 
+async function ensureCustomerDefaultPaymentMethod(customerId) {
+  let defaultPaymentMethod = await getDefaultPaymentMethod(customerId);
+  if (defaultPaymentMethod) {
+    return defaultPaymentMethod;
+  }
+
+  const paymentMethods = await stripe.paymentMethods.list({
+    customer: customerId,
+    type: "card",
+    limit: 10
+  });
+
+  const fallbackPaymentMethod = paymentMethods.data[0]?.id || null;
+  if (!fallbackPaymentMethod) {
+    return null;
+  }
+
+  await stripe.customers.update(customerId, {
+    invoice_settings: {
+      default_payment_method: fallbackPaymentMethod
+    }
+  });
+
+  return fallbackPaymentMethod;
+}
+
 // Allow your iOS app to call this endpoint (for demo use *)
 app.use(cors());
 
@@ -449,8 +475,233 @@ app.post(
         })();
         break;
       }
+      case "invoice.paid": {
+        const invoice = event.data.object;
+
+        (async () => {
+          try {
+            if (!invoice?.id || !invoice?.subscription) {
+              logError("INVALID INVOICE DATA", {
+                request_id: req.id,
+                invoice_id: invoice?.id || null
+              });
+              return;
+            }
+
+            const { rows } = await db.query(
+              `
+              SELECT *
+              FROM recurring_schedules
+              WHERE stripe_subscription_id = $1
+              LIMIT 1
+              `,
+              [invoice.subscription]
+            );
+
+            const schedule = rows[0];
+            if (!schedule) {
+              logInfo("INVOICE WITH NO SCHEDULE", {
+                request_id: req.id,
+                invoice_id: invoice.id,
+                stripe_subscription_id: invoice.subscription
+              });
+              return;
+            }
+
+            if (
+              schedule.end_date &&
+              invoice.created * 1000 >= new Date(schedule.end_date).getTime()
+            ) {
+              logInfo("INVOICE AFTER END DATE IGNORED", {
+                request_id: req.id,
+                invoice_id: invoice.id,
+                schedule_id: schedule.id
+              });
+              return;
+            }
+
+            const existingRecurring = await db.query(
+              `
+              SELECT donation_id
+              FROM recurring_donations
+              WHERE invoice_id = $1
+              LIMIT 1
+              `,
+              [invoice.id]
+            );
+
+            if (existingRecurring.rowCount > 0) {
+              logInfo("DUPLICATE RECURRING INVOICE IGNORED", {
+                request_id: req.id,
+                invoice_id: invoice.id
+              });
+              return;
+            }
+
+            const donationId = randomUUID();
+            const stripePaymentIntentId = invoice.payment_intent || invoice.id;
+
+            const donationInsert = await db.query(
+              `
+              INSERT INTO donations (
+                id,
+                amount_cents,
+                currency,
+                charity_id,
+                user_id,
+                stripe_payment_intent_id,
+                created_at
+              )
+              VALUES ($1, $2, $3, $4, $5, $6, now())
+              ON CONFLICT (stripe_payment_intent_id) DO NOTHING
+              RETURNING id
+              `,
+              [
+                donationId,
+                invoice.amount_paid,
+                invoice.currency || "usd",
+                schedule.charity_id,
+                schedule.user_id,
+                stripePaymentIntentId
+              ]
+            );
+
+            const persistedDonationId = donationInsert.rows[0]?.id || donationId;
+
+            await db.query(
+              `
+              INSERT INTO recurring_donations (
+                id,
+                schedule_id,
+                donation_id,
+                invoice_id,
+                created_at
+              )
+              VALUES ($1, $2, $3, $4, now())
+              ON CONFLICT (invoice_id) DO NOTHING
+              `,
+              [randomUUID(), schedule.id, persistedDonationId, invoice.id]
+            );
+
+            await db.query(
+              `
+              INSERT INTO receipts (
+                id,
+                donation_id,
+                tax_deductible,
+                created_at
+              )
+              VALUES ($1, $2, $3, now())
+              ON CONFLICT (donation_id) DO NOTHING
+              `,
+              [randomUUID(), persistedDonationId, true]
+            );
+
+            logInfo("RECURRING INVOICE PAID", {
+              request_id: req.id,
+              invoice_id: invoice.id,
+              schedule_id: schedule.id,
+              donation_id: persistedDonationId
+            });
+          } catch (error) {
+            logError("RECURRING INVOICE FAILED", {
+              request_id: req.id,
+              error: error.message
+            });
+          }
+        })();
+        break;
+      }
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object;
+
+        (async () => {
+          try {
+            if (!subscription?.id) {
+              logError("INVALID SUBSCRIPTION DATA", {
+                request_id: req.id
+              });
+              return;
+            }
+
+            await db.query(
+              `
+              UPDATE recurring_schedules
+              SET status = 'ended',
+                  canceled_at = now(),
+                  end_date = CASE
+                    WHEN $1 IS NULL THEN end_date
+                    ELSE to_timestamp($1)
+                  END
+              WHERE stripe_subscription_id = $2
+              `,
+              [subscription.cancel_at || null, subscription.id]
+            );
+
+            logInfo("RECURRING SUBSCRIPTION ENDED", {
+              request_id: req.id,
+              stripe_subscription_id: subscription.id
+            });
+          } catch (error) {
+            logError("SUBSCRIPTION DELETE SYNC FAILED", {
+              request_id: req.id,
+              error: error.message
+            });
+          }
+        })();
+        break;
+      }
+      case "customer.subscription.updated": {
+        const subscription = event.data.object;
+
+        (async () => {
+          try {
+            if (!subscription?.id) {
+              logError("INVALID SUBSCRIPTION DATA", {
+                request_id: req.id
+              });
+              return;
+            }
+
+            const status =
+              subscription.status === "canceled"
+                ? "ended"
+                : subscription.cancel_at_period_end
+                ? "canceled"
+                : "active";
+
+            await db.query(
+              `
+              UPDATE recurring_schedules
+              SET status = $1,
+                  end_date = CASE
+                    WHEN $2 IS NULL THEN end_date
+                    ELSE to_timestamp($2)
+                  END
+              WHERE stripe_subscription_id = $3
+              `,
+              [status, subscription.cancel_at || null, subscription.id]
+            );
+
+            logInfo("RECURRING SUBSCRIPTION UPDATED", {
+              request_id: req.id,
+              stripe_subscription_id: subscription.id,
+              status
+            });
+          } catch (error) {
+            logError("SUBSCRIPTION UPDATE SYNC FAILED", {
+              request_id: req.id,
+              error: error.message
+            });
+          }
+        })();
+        break;
+      }
       default:
-        console.log(`Unhandled event type: ${event.type}`);
+        logInfo("WEBHOOK IGNORED", {
+          request_id: req.id,
+          event_type: event.type
+        });
     }
 
     return res.status(200).json({ received: true });
@@ -801,7 +1052,11 @@ app.post("/recurring/setup-intent", authRequired, async (req, res) => {
 
     const setupIntent = await stripe.setupIntents.create({
       customer: customerId,
-      usage: "off_session"
+      usage: "off_session",
+      metadata: {
+        donor_id: donorId,
+        email
+      }
     });
 
     return res.json({
@@ -858,7 +1113,7 @@ app.post("/recurring", authRequired, async (req, res) => {
       userId: req.user?.id || null
     });
 
-    const defaultPaymentMethod = await getDefaultPaymentMethod(customerId);
+    const defaultPaymentMethod = await ensureCustomerDefaultPaymentMethod(customerId);
     if (!defaultPaymentMethod) {
       return res
         .status(400)
@@ -870,73 +1125,93 @@ app.post("/recurring", authRequired, async (req, res) => {
     const cancelAtUnix = endDate ? Math.floor(endDate.getTime() / 1000) : null;
 
     const subscriptionCurrency = currency || "usd";
-    const subscription = await stripe.subscriptions.create({
-      customer: customerId,
-      items: [
-        {
-          price_data: {
-            currency: subscriptionCurrency,
-            unit_amount: amount_cents,
-            recurring: { interval: frequency }
+    let subscription;
+    try {
+      subscription = await stripe.subscriptions.create({
+        customer: customerId,
+        items: [
+          {
+            price_data: {
+              currency: subscriptionCurrency,
+              unit_amount: amount_cents,
+              recurring: { interval: frequency }
+            }
           }
+        ],
+        metadata: {
+          donor_id: donorId,
+          charity_id,
+          email: req.user.email || ""
+        },
+        collection_method: "charge_automatically",
+        default_payment_method: defaultPaymentMethod,
+        ...(startUnix > nowUnix ? { trial_end: startUnix } : {}),
+        ...(cancelAtUnix ? { cancel_at: cancelAtUnix } : {})
+      });
+
+      const { rows } = await db.query(
+        `
+        INSERT INTO recurring_schedules (
+          id,
+          donor_id,
+          user_id,
+          charity_id,
+          frequency,
+          amount_cents,
+          currency,
+          start_date,
+          end_date,
+          stripe_customer_id,
+          stripe_subscription_id,
+          status
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        RETURNING *
+        `,
+        [
+          randomUUID(),
+          donorId,
+          req.user?.id || donorId,
+          charity_id,
+          frequency,
+          amount_cents,
+          subscriptionCurrency,
+          startDate.toISOString(),
+          endDate ? endDate.toISOString() : null,
+          customerId,
+          subscription.id,
+          "active"
+        ]
+      );
+
+      return res.json(rows[0]);
+    } catch (err) {
+      if (subscription?.id) {
+        try {
+          await stripe.subscriptions.del(subscription.id);
+          logInfo("RECURRING SUBSCRIPTION ROLLED BACK", {
+            request_id: req.id,
+            stripe_subscription_id: subscription.id
+          });
+        } catch (cancelErr) {
+          logError("RECURRING ROLLBACK FAILED", {
+            request_id: req.id,
+            stripe_subscription_id: subscription.id,
+            error: cancelErr.message
+          });
         }
-      ],
-      metadata: {
-        donor_id: donorId,
-        charity_id,
-        email: req.user.email || ""
-      },
-      collection_method: "charge_automatically",
-      default_payment_method: defaultPaymentMethod,
-      ...(startUnix > nowUnix ? { trial_end: startUnix } : {}),
-      ...(cancelAtUnix ? { cancel_at: cancelAtUnix } : {})
-    });
-
-    const { rows } = await db.query(
-      `
-      INSERT INTO recurring_schedules (
-        id,
-        donor_id,
-        user_id,
-        charity_id,
-        frequency,
-        amount_cents,
-        currency,
-        start_date,
-        end_date,
-        stripe_customer_id,
-        stripe_subscription_id,
-        status
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-      RETURNING *
-      `,
-      [
-        randomUUID(),
-        donorId,
-        req.user?.id || donorId,
-        charity_id,
-        frequency,
-        amount_cents,
-        subscriptionCurrency,
-        startDate.toISOString(),
-        endDate ? endDate.toISOString() : null,
-        customerId,
-        subscription.id,
-        "active"
-      ]
-    );
-
-    return res.json(rows[0]);
+      }
+      throw err;
+    }
   } catch (err) {
     logError("RECURRING CREATE FAILED", { error: err.message });
     return res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.get("/recurring", authOptional, async (req, res) => {
+app.get("/recurring", authRequired, async (req, res) => {
   try {
-    const donorId = resolveDonorId(req);
+    const donorId = req.user?.id;
     if (!donorId) {
       return res.status(400).json({ error: "Missing donor_id" });
     }
@@ -990,11 +1265,19 @@ app.post("/recurring/:id/cancel", authRequired, async (req, res) => {
       `
       UPDATE recurring_schedules
       SET status = $1,
-          canceled_at = now()
-      WHERE id = $2
+          canceled_at = now(),
+          end_date = CASE
+            WHEN $2 IS NULL THEN end_date
+            ELSE to_timestamp($2)
+          END
+      WHERE id = $3
       RETURNING *
       `,
-      [cancelAtPeriodEnd ? "canceled" : "ended", schedule.id]
+      [
+        cancelAtPeriodEnd ? "canceled" : "ended",
+        updated.cancel_at || null,
+        schedule.id
+      ]
     );
 
     return res.json(updatedRows[0]);
@@ -1128,6 +1411,25 @@ app.get("/receipts/:id/pdf", async (req, res) => {
       return res.status(404).json({ error: "receipt not found" });
     }
 
+    const donation = {
+      id: row.donationId,
+      amount: Number(row.amountCents || 0) / 100,
+      currency: row.currency || "usd",
+      charityId: row.charityId,
+      donorId: row.userId,
+      createdAt: row.createdAt
+    };
+    const receipt = {
+      id: row.id,
+      donationId: row.donationId,
+      amount: donation.amount,
+      currency: donation.currency,
+      charityId: donation.charityId,
+      userId: donation.donorId,
+      createdAt: row.createdAt,
+      taxDeductible: true
+    };
+
     const storagePath = `receipts/${row.id}.pdf`;
     let signed = await supabase.storage
       .from("receipts")
@@ -1135,25 +1437,6 @@ app.get("/receipts/:id/pdf", async (req, res) => {
 
     if (signed.error || !signed.data?.signedUrl) {
       // If the PDF does not exist in storage yet, generate and upload it on demand.
-      const donation = {
-        id: row.donationId,
-        amount: Number(row.amountCents || 0) / 100,
-        currency: row.currency || "usd",
-        charityId: row.charityId,
-        donorId: row.userId,
-        createdAt: row.createdAt
-      };
-      const receipt = {
-        id: row.id,
-        donationId: row.donationId,
-        amount: donation.amount,
-        currency: donation.currency,
-        charityId: donation.charityId,
-        userId: donation.donorId,
-        createdAt: row.createdAt,
-        taxDeductible: true
-      };
-
       const pdfBuffer = await generateReceiptPdf(receipt, donation);
       const upload = await supabase.storage
         .from("receipts")
