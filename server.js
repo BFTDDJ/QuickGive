@@ -383,17 +383,53 @@ app.post(
               ]
             );
 
+            let donationId = result.rows[0]?.id || null;
+
             if (result.rowCount === 0) {
               logInfo("DUPLICATE WEBHOOK IGNORED", {
                 request_id: req.id,
                 stripe_payment_intent_id: stripePaymentIntentId
               });
+              const existingDonation = await db.query(
+                `
+                SELECT id
+                FROM donations
+                WHERE stripe_payment_intent_id = $1
+                LIMIT 1
+                `,
+                [stripePaymentIntentId]
+              );
+              donationId = existingDonation.rows[0]?.id || null;
             } else {
               logInfo("DONATION SAVED FROM WEBHOOK", {
                 request_id: req.id,
-                donation_id: result.rows[0].id,
+                donation_id: donationId,
                 stripe_payment_intent_id: stripePaymentIntentId
               });
+            }
+
+            if (donationId) {
+              const receiptInsert = await db.query(
+                `
+                INSERT INTO receipts (
+                  id,
+                  donation_id,
+                  created_at
+                )
+                VALUES ($1, $2, now())
+                ON CONFLICT (donation_id) DO NOTHING
+                RETURNING id
+                `,
+                [randomUUID(), donationId]
+              );
+
+              if (receiptInsert.rowCount > 0) {
+                logInfo("RECEIPT SAVED FROM WEBHOOK", {
+                  request_id: req.id,
+                  receipt_id: receiptInsert.rows[0].id,
+                  donation_id: donationId
+                });
+              }
             }
           } catch (error) {
             logError("WEBHOOK DONATION PERSIST FAILED", {
