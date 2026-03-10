@@ -1110,8 +1110,13 @@ app.get("/receipts/:id/pdf", async (req, res) => {
         r.id,
         r.donation_id AS "donationId",
         r.created_at AS "createdAt",
-        r.pdf_url AS "pdfUrl"
+        r.pdf_url AS "pdfUrl",
+        d.amount_cents AS "amountCents",
+        d.currency,
+        d.charity_id AS "charityId",
+        d.user_id AS "userId"
       FROM receipts r
+      JOIN donations d ON d.id = r.donation_id
       WHERE r.id = $1::uuid
       LIMIT 1
       `,
@@ -1124,13 +1129,52 @@ app.get("/receipts/:id/pdf", async (req, res) => {
     }
 
     const storagePath = `receipts/${row.id}.pdf`;
-    const signed = await supabase.storage
+    let signed = await supabase.storage
       .from("receipts")
       .createSignedUrl(storagePath, 600);
 
     if (signed.error || !signed.data?.signedUrl) {
-      console.error("RECEIPT SIGNED URL FAILED:", signed.error);
-      return res.status(404).json({ error: "receipt pdf not found" });
+      // If the PDF does not exist in storage yet, generate and upload it on demand.
+      const donation = {
+        id: row.donationId,
+        amount: Number(row.amountCents || 0) / 100,
+        currency: row.currency || "usd",
+        charityId: row.charityId,
+        donorId: row.userId,
+        createdAt: row.createdAt
+      };
+      const receipt = {
+        id: row.id,
+        donationId: row.donationId,
+        amount: donation.amount,
+        currency: donation.currency,
+        charityId: donation.charityId,
+        userId: donation.donorId,
+        createdAt: row.createdAt,
+        taxDeductible: true
+      };
+
+      const pdfBuffer = await generateReceiptPdf(receipt, donation);
+      const upload = await supabase.storage
+        .from("receipts")
+        .upload(storagePath, pdfBuffer, {
+          contentType: "application/pdf",
+          upsert: true
+        });
+
+      if (upload.error) {
+        console.error("RECEIPT PDF UPLOAD FAILED:", upload.error);
+        return res.status(404).json({ error: "receipt pdf not found" });
+      }
+
+      signed = await supabase.storage
+        .from("receipts")
+        .createSignedUrl(storagePath, 600);
+
+      if (signed.error || !signed.data?.signedUrl) {
+        console.error("RECEIPT SIGNED URL FAILED:", signed.error);
+        return res.status(404).json({ error: "receipt pdf not found" });
+      }
     }
 
     return res.redirect(signed.data.signedUrl);
