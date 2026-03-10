@@ -312,17 +312,42 @@ app.use((req, res, next) => {
   next();
 });
 
-// Stripe webhook must use raw body
-app.use("/stripe/webhook", webhookLimiter, express.raw({ type: "application/json" }));
+app.post(
+  "/stripe/webhook",
+  webhookLimiter,
+  express.raw({ type: "application/json" }),
+  (req, res) => {
+    const signature = req.headers["stripe-signature"];
+    let event;
 
-// JSON parsing for everything else
-const jsonParser = express.json();
-app.use((req, res, next) => {
-  if (req.originalUrl === "/stripe/webhook") {
-    return next();
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    console.log("Stripe event received:", event.type);
+
+    switch (event.type) {
+      case "payment_intent.succeeded": {
+        const paymentIntent = event.data.object;
+        console.log("Payment succeeded:", paymentIntent.id);
+        break;
+      }
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+
+    return res.status(200).json({ received: true });
   }
-  return jsonParser(req, res, next);
-});
+);
+
+app.use(express.json());
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -903,366 +928,6 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
     console.error("create-payment-intent error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
-});
-
-app.post("/stripe/webhook", (req, res) => {
-  const signature = req.headers["stripe-signature"];
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      signature,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    metrics.webhookFailures += 1;
-    console.error("Webhook signature verification failed:", err.message);
-    return res.status(400).send("Webhook Error");
-  }
-
-  logInfo("WEBHOOK EVENT", { request_id: req.id, event_type: event.type, event_id: event.id });
-
-  if (event.type === "payment_intent.succeeded") {
-    const paymentIntent = event.data?.object;
-    if (!paymentIntent || !paymentIntent.id) {
-      metrics.paymentFailures += 1;
-      logError("INVALID PAYMENT INTENT DATA", { request_id: req.id });
-      return res.json({ received: true });
-    }
-
-  const donorId = paymentIntent.metadata?.user_id || null;
-  const donorEmail = paymentIntent.metadata?.email || null;
-  const charityId = paymentIntent.metadata?.charity_id;
-  const amountReceived = paymentIntent.amount_received;
-  const currency = paymentIntent.currency || "usd";
-
-  if (!donorId || !donorEmail) {
-    logError("AUTH FAILURE", {
-      reason: "missing_user_identity",
-      request_id: req.id,
-      stripe_payment_intent_id: paymentIntent.id
-    });
-    return res.json({ received: true });
-  }
-
-  if (!charityId || !amountReceived || amountReceived <= 0) {
-    metrics.paymentFailures += 1;
-    logError("INVALID DONATION DATA", {
-      request_id: req.id,
-      stripe_payment_intent_id: paymentIntent.id,
-      donor_id: donorId,
-        amount: amountReceived,
-        charity_id: charityId
-      });
-      return res.json({ received: true });
-    }
-
-    logInfo("WEBHOOK RECEIVED", {
-      request_id: req.id,
-      stripe_payment_intent_id: paymentIntent.id,
-      donor_id: donorId,
-      amount: amountReceived,
-      charity_id: charityId
-    });
-
-    const donation = {
-      id: randomUUID(),
-      amount: amountReceived / 100,
-      currency,
-      charityId,
-      donorId,
-      paymentIntentId: paymentIntent.id,
-      createdAt: new Date().toISOString()
-    };
-
-    const receipt = {
-      id: randomUUID(),
-      donationId: donation.id
-    };
-
-    (async () => {
-      try {
-        const userCheck = await db.query(
-          `SELECT 1 FROM users WHERE id = $1 LIMIT 1`,
-          [donation.donorId]
-        );
-        if (userCheck.rowCount === 0) {
-          logError("USER NOT FOUND FOR DONATION", {
-            request_id: req.id,
-            donor_id: donation.donorId,
-            stripe_payment_intent_id: donation.paymentIntentId
-          });
-          return;
-        }
-
-        const donationInsert = await db.query(
-          `
-          INSERT INTO donations (
-            id,
-            amount_cents,
-            currency,
-            charity_id,
-            user_id,
-            stripe_payment_intent_id,
-            created_at
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
-          ON CONFLICT (stripe_payment_intent_id) DO NOTHING
-          RETURNING id
-          `,
-          [
-            donation.id,
-            amountReceived,
-            donation.currency,
-            donation.charityId,
-            donation.donorId,
-            donation.paymentIntentId,
-            donation.createdAt
-          ]
-        );
-
-        if (donationInsert.rowCount === 0) {
-          logInfo("DUPLICATE PAYMENT INTENT IGNORED", {
-            request_id: req.id,
-            stripe_payment_intent_id: donation.paymentIntentId,
-            donor_id: donation.donorId,
-            amount: amountReceived,
-            charity_id: charityId
-          });
-          return;
-        }
-
-        await db.query(
-          `
-          INSERT INTO receipts (
-            id,
-            donation_id,
-            created_at
-          )
-          VALUES ($1, $2, $3)
-          ON CONFLICT (donation_id) DO NOTHING
-          `,
-          [receipt.id, receipt.donationId, new Date().toISOString()]
-        );
-
-        try {
-          const receiptForPdf = {
-            id: receipt.id,
-            donationId: receipt.donationId,
-            createdAt: new Date().toISOString(),
-            taxDeductible: true
-          };
-
-          let pdfBuffer = await generateReceiptPdf(receiptForPdf, donation);
-          const storagePath = `receipts/${receipt.id}.pdf`;
-
-          const uploadResult = await supabase.storage
-            .from("receipts")
-            .upload(storagePath, pdfBuffer, {
-              contentType: "application/pdf",
-              upsert: true
-            });
-
-          pdfBuffer = null;
-
-          if (uploadResult.error) {
-            console.error("RECEIPT PDF UPLOAD FAILED:", uploadResult.error);
-          } else {
-            const signed = await supabase.storage
-              .from("receipts")
-              .createSignedUrl(storagePath, 600);
-
-            if (signed.error) {
-              console.error("RECEIPT SIGNED URL FAILED:", signed.error);
-            } else if (signed.data?.signedUrl) {
-              await db.query(
-                `
-                UPDATE receipts
-                SET pdf_url = $1
-                WHERE id = $2
-                `,
-                [signed.data.signedUrl, receipt.id]
-              );
-            }
-          }
-        } catch (err) {
-          console.error("RECEIPT PDF PROCESS FAILED:", err);
-        }
-
-        logInfo("DONATION AND RECEIPT SAVED TO DB", {
-          request_id: req.id,
-          donation_id: donation.id,
-          donor_id: donation.donorId,
-          stripe_payment_intent_id: donation.paymentIntentId
-        });
-      } catch (err) {
-        logError("DB SAVE FAILED", {
-          request_id: req.id,
-          donor_id: donation.donorId,
-          stripe_payment_intent_id: donation.paymentIntentId,
-          error: err.message
-        });
-      }
-    })();
-  } else if (event.type === "invoice.paid") {
-    const invoice = event.data?.object;
-    if (!invoice || !invoice.id || !invoice.subscription) {
-      logError("INVALID INVOICE DATA", { request_id: req.id });
-      return res.json({ received: true });
-    }
-
-    (async () => {
-      try {
-        const { rows } = await db.query(
-          `
-          SELECT * FROM recurring_schedules
-          WHERE stripe_subscription_id = $1
-          LIMIT 1
-          `,
-          [invoice.subscription]
-        );
-        const schedule = rows[0];
-        if (!schedule) {
-          logInfo("INVOICE WITH NO SCHEDULE", { invoice_id: invoice.id });
-          return;
-        }
-
-        if (
-          schedule.end_date &&
-          invoice.created * 1000 >= new Date(schedule.end_date).getTime()
-        ) {
-          logInfo("INVOICE AFTER END DATE IGNORED", {
-            invoice_id: invoice.id,
-            schedule_id: schedule.id
-          });
-          return;
-        }
-
-        const existing = await db.query(
-          `SELECT 1 FROM recurring_donations WHERE invoice_id = $1`,
-          [invoice.id]
-        );
-        if (existing.rowCount > 0) {
-          return;
-        }
-
-        const donationId = randomUUID();
-        const stripePaymentIntentId = invoice.payment_intent || invoice.id;
-
-        const donationInsert = await db.query(
-          `
-          INSERT INTO donations (
-            id,
-            amount_cents,
-            currency,
-            charity_id,
-            user_id,
-            stripe_payment_intent_id,
-            created_at
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, now())
-          ON CONFLICT (stripe_payment_intent_id) DO NOTHING
-          RETURNING id
-          `,
-          [
-            donationId,
-            invoice.amount_paid,
-            invoice.currency,
-            schedule.charity_id,
-            schedule.user_id,
-            stripePaymentIntentId
-          ]
-        );
-
-        await db.query(
-          `
-          INSERT INTO recurring_donations (
-            id,
-            schedule_id,
-            donation_id,
-            invoice_id,
-            created_at
-          )
-          VALUES ($1, $2, $3, $4, now())
-          ON CONFLICT (invoice_id) DO NOTHING
-          `,
-          [randomUUID(), schedule.id, donationId, invoice.id]
-        );
-
-        logInfo("RECURRING INVOICE PAID", {
-          invoice_id: invoice.id,
-          schedule_id: schedule.id,
-          donation_id: donationInsert.rows[0]?.id || null
-        });
-      } catch (err) {
-        logError("RECURRING INVOICE FAILED", { error: err.message });
-      }
-    })();
-  } else if (event.type === "customer.subscription.deleted") {
-    const subscription = event.data?.object;
-    if (!subscription || !subscription.id) {
-      logError("INVALID SUBSCRIPTION DATA", { request_id: req.id });
-      return res.json({ received: true });
-    }
-    (async () => {
-      try {
-        await db.query(
-          `
-          UPDATE recurring_schedules
-          SET status = 'ended', canceled_at = now()
-          WHERE stripe_subscription_id = $1
-          `,
-          [subscription.id]
-        );
-      } catch (err) {
-        logError("SUBSCRIPTION DELETE SYNC FAILED", {
-          request_id: req.id,
-          error: err.message
-        });
-      }
-    })();
-  } else if (event.type === "customer.subscription.updated") {
-    const subscription = event.data?.object;
-    if (!subscription || !subscription.id) {
-      logError("INVALID SUBSCRIPTION DATA", { request_id: req.id });
-      return res.json({ received: true });
-    }
-    const status =
-      subscription.status === "canceled"
-        ? "ended"
-        : subscription.cancel_at_period_end
-        ? "canceled"
-        : "active";
-    (async () => {
-      try {
-        await db.query(
-          `
-          UPDATE recurring_schedules
-          SET status = $1,
-              end_date = CASE
-                WHEN $2 IS NULL THEN end_date
-                ELSE to_timestamp($2)
-              END
-          WHERE stripe_subscription_id = $3
-          `,
-          [status, subscription.cancel_at, subscription.id]
-        );
-      } catch (err) {
-        logError("SUBSCRIPTION UPDATE SYNC FAILED", {
-          request_id: req.id,
-          error: err.message
-        });
-      }
-    })();
-  } else {
-    logInfo("WEBHOOK IGNORED", {
-      request_id: req.id,
-      event_type: event.type
-    });
-  }
-
-  res.json({ received: true });
 });
 
 app.get("/donations", authOptional, async (req, res) => {
