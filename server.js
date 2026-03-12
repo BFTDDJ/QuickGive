@@ -145,6 +145,19 @@ initUsersTable().catch((err) => {
   console.error("USERS TABLE INIT FAILED:", err);
 });
 
+async function initDonationsTable() {
+  await db.query(
+    `
+    ALTER TABLE donations
+      ADD COLUMN IF NOT EXISTS charity_name text
+    `
+  );
+}
+
+initDonationsTable().catch((err) => {
+  console.error("DONATIONS TABLE INIT FAILED:", err);
+});
+
 function signToken(userId, email) {
   return jwt.sign({ sub: userId, email }, process.env.JWT_SECRET_CURRENT, {
     header: { kid: "current" },
@@ -369,6 +382,7 @@ app.post(
           try {
             const donorId = paymentIntent?.metadata?.user_id || null;
             const charityId = paymentIntent?.metadata?.charity_id || null;
+            const charityName = paymentIntent?.metadata?.charity_name || null;
             const amountCents = paymentIntent?.amount_received || 0;
             const currency = paymentIntent?.currency || "usd";
             const stripePaymentIntentId = paymentIntent?.id || null;
@@ -391,11 +405,12 @@ app.post(
                 amount_cents,
                 currency,
                 charity_id,
+                charity_name,
                 user_id,
                 stripe_payment_intent_id,
                 created_at
               )
-              VALUES ($1, $2, $3, $4, $5, $6, now())
+              VALUES ($1, $2, $3, $4, $5, $6, $7, now())
               ON CONFLICT (stripe_payment_intent_id) DO NOTHING
               RETURNING id
               `,
@@ -404,6 +419,7 @@ app.post(
                 amountCents,
                 currency,
                 charityId,
+                charityName,
                 donorId,
                 stripePaymentIntentId
               ]
@@ -548,11 +564,12 @@ app.post(
                 amount_cents,
                 currency,
                 charity_id,
+                charity_name,
                 user_id,
                 stripe_payment_intent_id,
                 created_at
               )
-              VALUES ($1, $2, $3, $4, $5, $6, now())
+              VALUES ($1, $2, $3, $4, $5, $6, $7, now())
               ON CONFLICT (stripe_payment_intent_id) DO NOTHING
               RETURNING id
               `,
@@ -561,6 +578,7 @@ app.post(
                 invoice.amount_paid,
                 invoice.currency || "usd",
                 schedule.charity_id,
+                null,
                 schedule.user_id,
                 stripePaymentIntentId
               ]
@@ -1339,7 +1357,7 @@ app.post("/recurring/:id/cancel", authRequired, async (req, res) => {
 
 app.post("/create-payment-intent", authRequired, async (req, res) => {
   try {
-    const { amount, currency = "usd", charity_id, user_id, email } = req.body;
+    const { amount, currency = "usd", charity_id, charity_name } = req.body;
 
     if (!amount || typeof amount !== "number" || amount <= 0) {
       return res.status(400).json({ error: "Invalid amount" });
@@ -1360,6 +1378,7 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
       automatic_payment_methods: { enabled: true },
       metadata: {
         charity_id,
+        ...(charity_name ? { charity_name } : {}),
         user_id: donorId,
         email: userEmail,
         app: "Dono"
@@ -1387,6 +1406,7 @@ app.get("/donations", authOptional, async (req, res) => {
         amount_cents,
         currency,
         charity_id AS "charityId",
+        COALESCE(charity_name, charity_id) AS "charityName",
         user_id AS "donorId",
         stripe_payment_intent_id AS "paymentIntentId",
         created_at AS "createdAt"
