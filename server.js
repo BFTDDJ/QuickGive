@@ -152,10 +152,49 @@ async function initDonationsTable() {
       ADD COLUMN IF NOT EXISTS charity_name text
     `
   );
+  await db.query(
+    `
+    UPDATE donations
+    SET charity_name = charity_id::text
+    WHERE charity_name IS NULL
+    `
+  );
+  await db.query(
+    `
+    ALTER TABLE donations
+      ALTER COLUMN charity_name SET NOT NULL
+    `
+  );
 }
 
 initDonationsTable().catch((err) => {
   console.error("DONATIONS TABLE INIT FAILED:", err);
+});
+
+async function initRecurringSchedulesTable() {
+  await db.query(
+    `
+    ALTER TABLE recurring_schedules
+      ADD COLUMN IF NOT EXISTS charity_name text
+    `
+  );
+  await db.query(
+    `
+    UPDATE recurring_schedules
+    SET charity_name = charity_id::text
+    WHERE charity_name IS NULL
+    `
+  );
+  await db.query(
+    `
+    ALTER TABLE recurring_schedules
+      ALTER COLUMN charity_name SET NOT NULL
+    `
+  );
+}
+
+initRecurringSchedulesTable().catch((err) => {
+  console.error("RECURRING SCHEDULES TABLE INIT FAILED:", err);
 });
 
 function signToken(userId, email) {
@@ -382,17 +421,18 @@ app.post(
           try {
             const donorId = paymentIntent?.metadata?.user_id || null;
             const charityId = paymentIntent?.metadata?.charity_id || null;
-            const charityName = paymentIntent?.metadata?.charity_name || null;
+            const charityName = paymentIntent?.metadata?.charity_name || charityId || null;
             const amountCents = paymentIntent?.amount_received || 0;
             const currency = paymentIntent?.currency || "usd";
             const stripePaymentIntentId = paymentIntent?.id || null;
 
-            if (!donorId || !charityId || !stripePaymentIntentId || amountCents <= 0) {
+            if (!donorId || !charityId || !charityName || !stripePaymentIntentId || amountCents <= 0) {
               logError("WEBHOOK DONATION SKIPPED INVALID DATA", {
                 request_id: req.id,
                 stripe_payment_intent_id: stripePaymentIntentId,
                 donor_id: donorId,
                 charity_id: charityId,
+                charity_name: charityName,
                 amount_cents: amountCents
               });
               return;
@@ -578,7 +618,7 @@ app.post(
                 invoice.amount_paid,
                 invoice.currency || "usd",
                 schedule.charity_id,
-                null,
+                schedule.charity_name || schedule.charity_id,
                 schedule.user_id,
                 stripePaymentIntentId
               ]
@@ -1142,6 +1182,7 @@ app.post("/recurring", authRequired, async (req, res) => {
     const donorId = req.user?.id;
     const {
       charity_id,
+      charity_name,
       amount_cents,
       frequency,
       start_date,
@@ -1149,7 +1190,7 @@ app.post("/recurring", authRequired, async (req, res) => {
       currency
     } = req.body || {};
 
-    if (!donorId || !charity_id || !amount_cents || amount_cents <= 0) {
+    if (!donorId || !charity_id || !charity_name || !amount_cents || amount_cents <= 0) {
       return res.status(400).json({ error: "Missing or invalid fields" });
     }
     if (!req.user?.email) {
@@ -1209,6 +1250,7 @@ app.post("/recurring", authRequired, async (req, res) => {
         metadata: {
           donor_id: donorId,
           charity_id,
+          charity_name,
           email: req.user.email || ""
         },
         collection_method: "charge_automatically",
@@ -1224,6 +1266,7 @@ app.post("/recurring", authRequired, async (req, res) => {
           donor_id,
           user_id,
           charity_id,
+          charity_name,
           frequency,
           amount_cents,
           currency,
@@ -1233,7 +1276,7 @@ app.post("/recurring", authRequired, async (req, res) => {
           stripe_subscription_id,
           status
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         RETURNING *
         `,
         [
@@ -1241,6 +1284,7 @@ app.post("/recurring", authRequired, async (req, res) => {
           donorId,
           req.user?.id || donorId,
           charity_id,
+          charity_name,
           frequency,
           amount_cents,
           subscriptionCurrency,
@@ -1365,6 +1409,9 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
     if (!charity_id || typeof charity_id !== "string") {
       return res.status(400).json({ error: "Missing charity_id" });
     }
+    if (!charity_name || typeof charity_name !== "string" || !charity_name.trim()) {
+      return res.status(400).json({ error: "Missing charity_name" });
+    }
 
     const donorId = req.user?.id;
     const userEmail = req.user?.email;
@@ -1378,7 +1425,7 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
       automatic_payment_methods: { enabled: true },
       metadata: {
         charity_id,
-        ...(charity_name ? { charity_name } : {}),
+        charity_name: charity_name.trim(),
         user_id: donorId,
         email: userEmail,
         app: "Dono"
@@ -1406,7 +1453,7 @@ app.get("/donations", authOptional, async (req, res) => {
         amount_cents,
         currency,
         charity_id AS "charityId",
-        COALESCE(charity_name, charity_id) AS "charityName",
+        charity_name AS "charityName",
         user_id AS "donorId",
         stripe_payment_intent_id AS "paymentIntentId",
         created_at AS "createdAt"
