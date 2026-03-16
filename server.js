@@ -1068,19 +1068,25 @@ app.post("/auth/apple", authLimiter, async (req, res) => {
       if (byEmail.rowCount > 0) {
         userId = byEmail.rows[0].id;
         userEmail = byEmail.rows[0].email;
-        await db.query(`UPDATE users SET apple_sub = $1 WHERE id = $2`, [
-          appleSub,
-          userId
-        ]);
-      } else {
-        userId = randomUUID();
         await db.query(
           `
-          INSERT INTO users (id, email, full_name, apple_sub)
-          VALUES ($1, $2, $3, $4)
-          ON CONFLICT (apple_sub) DO NOTHING
+          UPDATE users
+          SET apple_sub = $1,
+              auth_provider = 'apple',
+              full_name = COALESCE(full_name, $2)
+          WHERE id = $3
           `,
-          [userId, email, fullName || null, appleSub]
+          [appleSub, fullName || null, userId]
+        );
+      } else {
+        userId = randomUUID();
+        const placeholderHash = await bcrypt.hash(randomUUID(), 10);
+        await db.query(
+          `
+          INSERT INTO users (id, email, password_hash, full_name, auth_provider, apple_sub)
+          VALUES ($1, $2, $3, $4, 'apple', $5)
+          `,
+          [userId, email, placeholderHash, fullName || null, appleSub]
         );
       }
     } else {
