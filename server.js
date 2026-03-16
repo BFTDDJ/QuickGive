@@ -334,8 +334,24 @@ async function ensureCustomerDefaultPaymentMethod(customerId) {
   return fallbackPaymentMethod;
 }
 
-// Allow your iOS app to call this endpoint (for demo use *)
-app.use(cors());
+const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) {
+        return callback(null, true);
+      }
+      if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Not allowed by CORS"));
+    }
+  })
+);
 
 // Request ID + request logging
 app.use((req, res, next) => {
@@ -377,18 +393,6 @@ const webhookLimiter = rateLimit({
 });
 
 app.use(globalLimiter);
-
-// TEMP auth header logging (remove after debugging)
-app.use((req, res, next) => {
-  const authHeader = req.headers.authorization;
-  const donorHeader = req.headers["x-donor-id"];
-  logInfo("REQ HEADERS", {
-    request_id: req.id,
-    authorization: authHeader || null,
-    "x-donor-id": donorHeader || null
-  });
-  next();
-});
 
 app.post(
   "/stripe/webhook",
@@ -1439,7 +1443,7 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
   }
 });
 
-app.get("/donations", authOptional, async (req, res) => {
+app.get("/donations", authRequired, async (req, res) => {
   console.log("🔥 /donations HIT", new Date().toISOString());
   try {
     const donorId = resolveDonorId(req);
@@ -1470,7 +1474,7 @@ app.get("/donations", authOptional, async (req, res) => {
   }
 });
 
-app.get("/receipts", authOptional, async (req, res) => {
+app.get("/receipts", authRequired, async (req, res) => {
   try {
     const donorId = resolveDonorId(req);
     if (!donorId) {
@@ -1502,7 +1506,7 @@ app.get("/receipts", authOptional, async (req, res) => {
   }
 });
 
-app.get("/receipts/:id/pdf", async (req, res) => {
+app.get("/receipts/:id/pdf", authRequired, async (req, res) => {
   try {
     const { rows } = await db.query(
       `
@@ -1518,9 +1522,10 @@ app.get("/receipts/:id/pdf", async (req, res) => {
       FROM receipts r
       JOIN donations d ON d.id = r.donation_id
       WHERE r.id = $1::uuid
+        AND d.user_id = $2
       LIMIT 1
       `,
-      [req.params.id]
+      [req.params.id, req.user.id]
     );
 
     const row = rows[0];
@@ -1584,7 +1589,7 @@ app.get("/receipts/:id/pdf", async (req, res) => {
   }
 });
 
-app.get("/tax-summary", authOptional, async (req, res) => {
+app.get("/tax-summary", authRequired, async (req, res) => {
   try {
     const donorId = resolveDonorId(req);
     if (!donorId) {
@@ -1617,7 +1622,7 @@ app.get("/tax-summary", authOptional, async (req, res) => {
   }
 });
 
-app.get("/tax-summary/:year/pdf", authOptional, async (req, res) => {
+app.get("/tax-summary/:year/pdf", authRequired, async (req, res) => {
   const year = parseInt(req.params.year, 10);
   try {
     const donorId = resolveDonorId(req);
