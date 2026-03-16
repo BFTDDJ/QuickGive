@@ -105,6 +105,8 @@ async function initUsersTable() {
       email text UNIQUE,
       password_hash text,
       full_name text,
+      auth_provider text DEFAULT 'password',
+      google_sub text,
       stripe_customer_id text,
       created_at timestamptz DEFAULT now()
     )
@@ -116,6 +118,8 @@ async function initUsersTable() {
       ADD COLUMN IF NOT EXISTS email text,
       ADD COLUMN IF NOT EXISTS password_hash text,
       ADD COLUMN IF NOT EXISTS full_name text,
+      ADD COLUMN IF NOT EXISTS auth_provider text DEFAULT 'password',
+      ADD COLUMN IF NOT EXISTS google_sub text,
       ADD COLUMN IF NOT EXISTS apple_sub text,
       ADD COLUMN IF NOT EXISTS stripe_customer_id text,
       ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now()
@@ -125,6 +129,20 @@ async function initUsersTable() {
     `
     CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique
     ON users (email)
+    `
+  );
+  await db.query(
+    `
+    UPDATE users
+    SET auth_provider = 'password'
+    WHERE auth_provider IS NULL
+    `
+  );
+  await db.query(
+    `
+    CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub_unique
+    ON users (google_sub)
+    WHERE google_sub IS NOT NULL
     `
   );
   await db.query(
@@ -941,28 +959,63 @@ app.post("/auth/google", authLimiter, async (req, res) => {
 
     const payload = ticket.getPayload();
     const email = payload?.email;
+    const googleSub = payload?.sub;
     if (!email) {
       return res.status(400).json({ error: "Missing email from Google" });
     }
+    if (!googleSub) {
+      return res.status(400).json({ error: "Missing Google subject" });
+    }
 
-    const existing = await db.query(
-      `SELECT id, email FROM users WHERE email = $1 LIMIT 1`,
-      [email]
+    const existingByGoogleSub = await db.query(
+      `
+      SELECT id, email, google_sub
+      FROM users
+      WHERE google_sub = $1
+      LIMIT 1
+      `,
+      [googleSub]
     );
 
     let userId;
-    if (existing.rowCount > 0) {
-      userId = existing.rows[0].id;
+    if (existingByGoogleSub.rowCount > 0) {
+      userId = existingByGoogleSub.rows[0].id;
     } else {
-      userId = randomUUID();
-      await db.query(
+      const existingByEmail = await db.query(
         `
-        INSERT INTO users (id, email, full_name)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (email) DO NOTHING
+        SELECT id, email, google_sub
+        FROM users
+        WHERE email = $1
+        LIMIT 1
         `,
-        [userId, email, fullName || payload?.name || null]
+        [email]
       );
+
+      if (existingByEmail.rowCount > 0) {
+        userId = existingByEmail.rows[0].id;
+        if (!existingByEmail.rows[0].google_sub) {
+          await db.query(
+            `
+            UPDATE users
+            SET google_sub = $1,
+                auth_provider = 'google',
+                full_name = COALESCE(full_name, $2)
+            WHERE id = $3
+            `,
+            [googleSub, fullName || payload?.name || null, userId]
+          );
+        }
+      } else {
+        userId = randomUUID();
+        const placeholderHash = await bcrypt.hash(randomUUID(), 10);
+        await db.query(
+          `
+          INSERT INTO users (id, email, password_hash, full_name, auth_provider, google_sub)
+          VALUES ($1, $2, $3, $4, 'google', $5)
+          `,
+          [userId, email, placeholderHash, fullName || payload?.name || null, googleSub]
+        );
+      }
     }
 
     const token = signToken(userId, email);
