@@ -279,43 +279,27 @@ function resolveDonorId(req) {
   );
 }
 
-async function getOrCreateStripeCustomer({ donorId, email, userId }) {
-  if (userId) {
-    const { rows } = await db.query(
-      `SELECT stripe_customer_id FROM users WHERE id = $1`,
-      [userId]
-    );
-    const existing = rows[0]?.stripe_customer_id;
-    if (existing) return existing;
-  } else {
-    const { rows } = await db.query(
-      `SELECT stripe_customer_id FROM donor_stripe_customers WHERE donor_id = $1`,
-      [donorId]
-    );
-    const existing = rows[0]?.stripe_customer_id;
-    if (existing) return existing;
+async function getOrCreateStripeCustomerForUser({ userId, email }) {
+  if (!userId || !email) {
+    throw new Error("Missing authenticated user context for Stripe customer");
   }
+
+  const { rows } = await db.query(
+    `SELECT stripe_customer_id FROM users WHERE id = $1`,
+    [userId]
+  );
+  const existing = rows[0]?.stripe_customer_id;
+  if (existing) return existing;
 
   const customer = await stripe.customers.create({
-    email: email || undefined,
-    metadata: { donor_id: donorId }
+    email,
+    metadata: { user_id: userId, email }
   });
 
-  if (userId) {
-    await db.query(
-      `UPDATE users SET stripe_customer_id = $1 WHERE id = $2`,
-      [customer.id, userId]
-    );
-  } else {
-    await db.query(
-      `
-      INSERT INTO donor_stripe_customers (donor_id, stripe_customer_id)
-      VALUES ($1, $2)
-      ON CONFLICT (donor_id) DO NOTHING
-      `,
-      [donorId, customer.id]
-    );
-  }
+  await db.query(
+    `UPDATE users SET stripe_customer_id = $1 WHERE id = $2`,
+    [customer.id, userId]
+  );
 
   return customer.id;
 }
@@ -378,7 +362,8 @@ app.use((req, res, next) => {
   logInfo("REQUEST", {
     request_id: req.id,
     method: req.method,
-    path: req.path
+    path: req.path,
+    authorization_present: Boolean(req.headers.authorization)
   });
   res.on("finish", () => {
     if (res.statusCode >= 500) {
@@ -441,18 +426,18 @@ app.post(
         // Respond immediately to Stripe, then persist asynchronously.
         (async () => {
           try {
-            const donorId = paymentIntent?.metadata?.user_id || null;
+            const userId = paymentIntent?.metadata?.user_id || null;
             const charityId = paymentIntent?.metadata?.charity_id || null;
             const charityName = paymentIntent?.metadata?.charity_name || charityId || null;
             const amountCents = paymentIntent?.amount_received || 0;
             const currency = paymentIntent?.currency || "usd";
             const stripePaymentIntentId = paymentIntent?.id || null;
 
-            if (!donorId || !charityId || !charityName || !stripePaymentIntentId || amountCents <= 0) {
+            if (!userId || !charityId || !charityName || !stripePaymentIntentId || amountCents <= 0) {
               logError("WEBHOOK DONATION SKIPPED INVALID DATA", {
                 request_id: req.id,
                 stripe_payment_intent_id: stripePaymentIntentId,
-                donor_id: donorId,
+                user_id: userId,
                 charity_id: charityId,
                 charity_name: charityName,
                 amount_cents: amountCents
@@ -482,7 +467,7 @@ app.post(
                 currency,
                 charityId,
                 charityName,
-                donorId,
+                userId,
                 stripePaymentIntentId
               ]
             );
@@ -1209,23 +1194,22 @@ app.post("/auth/reset-password", authLimiter, async (req, res) => {
 
 app.post("/recurring/setup-intent", authRequired, async (req, res) => {
   try {
-    const donorId = req.user?.id;
+    const userId = req.user?.id;
     const email = req.user?.email;
-    if (!email) {
+    if (!userId || !email) {
       logError("AUTH FAILURE", { reason: "missing_email", request_id: req.id });
-      return res.status(400).json({ error: "Missing user email" });
+      return res.status(400).json({ error: "Missing authenticated user email" });
     }
-    const customerId = await getOrCreateStripeCustomer({
-      donorId,
+    const customerId = await getOrCreateStripeCustomerForUser({
+      userId,
       email,
-      userId: req.user?.id || null
     });
 
     const setupIntent = await stripe.setupIntents.create({
       customer: customerId,
       usage: "off_session",
       metadata: {
-        donor_id: donorId,
+        user_id: userId,
         email
       }
     });
@@ -1242,7 +1226,7 @@ app.post("/recurring/setup-intent", authRequired, async (req, res) => {
 
 app.post("/recurring", authRequired, async (req, res) => {
   try {
-    const donorId = req.user?.id;
+    const userId = req.user?.id;
     const {
       charity_id,
       charity_name,
@@ -1253,12 +1237,12 @@ app.post("/recurring", authRequired, async (req, res) => {
       currency
     } = req.body || {};
 
-    if (!donorId || !charity_id || !charity_name || !amount_cents || amount_cents <= 0) {
+    if (!userId || !charity_id || !charity_name || !amount_cents || amount_cents <= 0) {
       return res.status(400).json({ error: "Missing or invalid fields" });
     }
     if (!req.user?.email) {
       logError("AUTH FAILURE", { reason: "missing_email", request_id: req.id });
-      return res.status(400).json({ error: "Missing user email" });
+      return res.status(400).json({ error: "Missing authenticated user email" });
     }
     if (!["weekly", "monthly"].includes(frequency)) {
       return res.status(400).json({ error: "Invalid frequency" });
@@ -1279,10 +1263,9 @@ app.post("/recurring", authRequired, async (req, res) => {
       }
     }
 
-    const customerId = await getOrCreateStripeCustomer({
-      donorId,
+    const customerId = await getOrCreateStripeCustomerForUser({
+      userId,
       email: req.user.email,
-      userId: req.user?.id || null
     });
 
     const defaultPaymentMethod = await ensureCustomerDefaultPaymentMethod(customerId);
@@ -1311,7 +1294,7 @@ app.post("/recurring", authRequired, async (req, res) => {
           }
         ],
         metadata: {
-          donor_id: donorId,
+          user_id: userId,
           charity_id,
           charity_name,
           email: req.user.email || ""
@@ -1344,8 +1327,8 @@ app.post("/recurring", authRequired, async (req, res) => {
         `,
         [
           randomUUID(),
-          donorId,
-          req.user?.id || donorId,
+          userId,
+          userId,
           charity_id,
           charity_name,
           frequency,
@@ -1386,9 +1369,9 @@ app.post("/recurring", authRequired, async (req, res) => {
 
 app.get("/recurring", authRequired, async (req, res) => {
   try {
-    const donorId = req.user?.id;
-    if (!donorId) {
-      return res.status(400).json({ error: "Missing donor_id" });
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(400).json({ error: "Missing user_id" });
     }
     const { rows } = await db.query(
       `
@@ -1397,7 +1380,7 @@ app.get("/recurring", authRequired, async (req, res) => {
       WHERE donor_id = $1
       ORDER BY created_at DESC
       `,
-      [donorId]
+      [userId]
     );
     return res.json(rows);
   } catch (err) {
@@ -1408,7 +1391,7 @@ app.get("/recurring", authRequired, async (req, res) => {
 
 app.post("/recurring/:id/cancel", authRequired, async (req, res) => {
   try {
-    const donorId = req.user?.id;
+    const userId = req.user?.id;
     const { rows } = await db.query(
       `
       SELECT *
@@ -1416,7 +1399,7 @@ app.post("/recurring/:id/cancel", authRequired, async (req, res) => {
       WHERE id = $1 AND donor_id = $2
       LIMIT 1
       `,
-      [req.params.id, donorId]
+      [req.params.id, userId]
     );
     const schedule = rows[0];
     if (!schedule) {
@@ -1476,11 +1459,11 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
       return res.status(400).json({ error: "Missing charity_name" });
     }
 
-    const donorId = req.user?.id;
+    const userId = req.user?.id;
     const userEmail = req.user?.email;
-    if (!userEmail) {
+    if (!userId || !userEmail) {
       logError("AUTH FAILURE", { reason: "missing_email", request_id: req.id });
-      return res.status(400).json({ error: "Missing user email" });
+      return res.status(400).json({ error: "Missing authenticated user email" });
     }
     const paymentIntent = await stripe.paymentIntents.create({
       amount, // cents
@@ -1489,7 +1472,7 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
       metadata: {
         charity_id,
         charity_name: charity_name.trim(),
-        user_id: donorId,
+        user_id: userId,
         email: userEmail,
         app: "Dono"
       }
@@ -1499,6 +1482,56 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
   } catch (err) {
     console.error("create-payment-intent error:", err);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/web/create-checkout-session", authRequired, async (req, res) => {
+  try {
+    const { charity_id, amount } = req.query;
+    const userId = req.user?.id;
+    const userEmail = req.user?.email;
+
+    if (!charity_id || typeof charity_id !== "string") {
+      return res.status(400).json({ error: "Missing charity_id" });
+    }
+    if (!userId || !userEmail) {
+      return res.status(400).json({ error: "Missing authenticated user email" });
+    }
+
+    const amountCents = amount ? parseInt(amount, 10) : 1000;
+    if (!Number.isInteger(amountCents) || amountCents <= 0) {
+      return res.status(400).json({ error: "Invalid amount" });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      customer_email: userEmail,
+      success_url: "https://quickgive.com/donation-success",
+      cancel_url: "https://quickgive.com/donation-canceled",
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: "QuickGive Donation"
+            },
+            unit_amount: amountCents
+          },
+          quantity: 1
+        }
+      ],
+      metadata: {
+        charity_id,
+        user_id: userId,
+        email: userEmail
+      }
+    });
+
+    return res.redirect(session.url);
+  } catch (err) {
+    console.error("create-checkout-session error:", err);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
