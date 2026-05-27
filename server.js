@@ -215,6 +215,74 @@ initRecurringSchedulesTable().catch((err) => {
   console.error("RECURRING SCHEDULES TABLE INIT FAILED:", err);
 });
 
+async function initSchoolCommunitySchema() {
+  await db.query(
+    `
+    CREATE TABLE IF NOT EXISTS schools (
+      id uuid PRIMARY KEY,
+      name text NOT NULL,
+      city text,
+      state text,
+      kind text,
+      created_at timestamptz DEFAULT now()
+    )
+    `
+  );
+  await db.query(
+    `
+    CREATE TABLE IF NOT EXISTS organizations (
+      id uuid PRIMARY KEY,
+      school_id uuid REFERENCES schools(id) ON DELETE SET NULL,
+      name text NOT NULL,
+      category text NOT NULL,
+      description text,
+      created_at timestamptz DEFAULT now()
+    )
+    `
+  );
+  await db.query(
+    `
+    CREATE TABLE IF NOT EXISTS campaigns (
+      id uuid PRIMARY KEY,
+      organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      name text NOT NULL,
+      description text,
+      goal_amount_cents integer,
+      is_active boolean DEFAULT true,
+      created_at timestamptz DEFAULT now()
+    )
+    `
+  );
+  await db.query(
+    `
+    ALTER TABLE donations
+      ADD COLUMN IF NOT EXISTS organization_id uuid,
+      ADD COLUMN IF NOT EXISTS campaign_id uuid
+    `
+  );
+  await db.query(
+    `
+    ALTER TABLE recurring_schedules
+      ADD COLUMN IF NOT EXISTS organization_id uuid,
+      ADD COLUMN IF NOT EXISTS campaign_id uuid
+    `
+  );
+}
+
+initSchoolCommunitySchema().catch((err) => {
+  console.error("SCHOOL COMMUNITY SCHEMA INIT FAILED:", err);
+});
+
+function normalizeOptionalUuid(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimmed)
+    ? trimmed
+    : null;
+}
+
 function signToken(userId, email) {
   return jwt.sign({ sub: userId, email }, process.env.JWT_SECRET_CURRENT, {
     header: { kid: "current" },
@@ -427,6 +495,14 @@ app.post(
         (async () => {
           try {
             const userId = paymentIntent?.metadata?.user_id || null;
+            const organizationId = normalizeOptionalUuid(
+              paymentIntent?.metadata?.organization_id
+            );
+            const campaignId = normalizeOptionalUuid(
+              paymentIntent?.metadata?.campaign_id
+            );
+            // Legacy charity_id remains supported while the product moves to
+            // organization_id/campaign_id for school-community fundraising.
             const charityId = paymentIntent?.metadata?.charity_id || null;
             const charityName = paymentIntent?.metadata?.charity_name || charityId || null;
             const amountCents = paymentIntent?.amount_received || 0;
@@ -451,13 +527,15 @@ app.post(
                 id,
                 amount_cents,
                 currency,
+                organization_id,
+                campaign_id,
                 charity_id,
                 charity_name,
                 user_id,
                 stripe_payment_intent_id,
                 created_at
               )
-              VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
               ON CONFLICT (stripe_payment_intent_id) DO NOTHING
               RETURNING id
               `,
@@ -465,6 +543,8 @@ app.post(
                 randomUUID(),
                 amountCents,
                 currency,
+                organizationId,
+                campaignId,
                 charityId,
                 charityName,
                 userId,
@@ -610,13 +690,15 @@ app.post(
                 id,
                 amount_cents,
                 currency,
+                organization_id,
+                campaign_id,
                 charity_id,
                 charity_name,
                 user_id,
                 stripe_payment_intent_id,
                 created_at
               )
-              VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
               ON CONFLICT (stripe_payment_intent_id) DO NOTHING
               RETURNING id
               `,
@@ -624,6 +706,8 @@ app.post(
                 donationId,
                 invoice.amount_paid,
                 invoice.currency || "usd",
+                schedule.organization_id || null,
+                schedule.campaign_id || null,
                 schedule.charity_id,
                 schedule.charity_name || schedule.charity_id,
                 schedule.user_id,
@@ -1228,6 +1312,8 @@ app.post("/recurring", authRequired, async (req, res) => {
   try {
     const userId = req.user?.id;
     const {
+      organization_id,
+      campaign_id,
       charity_id,
       charity_name,
       amount_cents,
@@ -1295,6 +1381,8 @@ app.post("/recurring", authRequired, async (req, res) => {
         ],
         metadata: {
           user_id: userId,
+          organization_id: organization_id || "",
+          campaign_id: campaign_id || "",
           charity_id,
           charity_name,
           email: req.user.email || ""
@@ -1311,6 +1399,8 @@ app.post("/recurring", authRequired, async (req, res) => {
           id,
           donor_id,
           user_id,
+          organization_id,
+          campaign_id,
           charity_id,
           charity_name,
           frequency,
@@ -1322,13 +1412,15 @@ app.post("/recurring", authRequired, async (req, res) => {
           stripe_subscription_id,
           status
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
         RETURNING *
         `,
         [
           randomUUID(),
           userId,
           userId,
+          normalizeOptionalUuid(organization_id),
+          normalizeOptionalUuid(campaign_id),
           charity_id,
           charity_name,
           frequency,
@@ -1447,7 +1539,14 @@ app.post("/recurring/:id/cancel", authRequired, async (req, res) => {
 
 app.post("/create-payment-intent", authRequired, async (req, res) => {
   try {
-    const { amount, currency = "usd", charity_id, charity_name } = req.body;
+    const {
+      amount,
+      currency = "usd",
+      organization_id,
+      campaign_id,
+      charity_id,
+      charity_name
+    } = req.body;
 
     if (!amount || typeof amount !== "number" || amount <= 0) {
       return res.status(400).json({ error: "Invalid amount" });
@@ -1470,6 +1569,9 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
       currency,
       automatic_payment_methods: { enabled: true },
       metadata: {
+        organization_id: normalizeOptionalUuid(organization_id) || "",
+        campaign_id: normalizeOptionalUuid(campaign_id) || "",
+        // Legacy charity fields remain for backward compatibility.
         charity_id,
         charity_name: charity_name.trim(),
         user_id: userId,
@@ -1487,12 +1589,17 @@ app.post("/create-payment-intent", authRequired, async (req, res) => {
 
 app.get("/web/create-checkout-session", authRequired, async (req, res) => {
   try {
-    const { charity_id, amount } = req.query;
+    const { organization_id, campaign_id, charity_id, amount } = req.query;
     const userId = req.user?.id;
     const userEmail = req.user?.email;
 
-    if (!charity_id || typeof charity_id !== "string") {
-      return res.status(400).json({ error: "Missing charity_id" });
+    if (
+      (!organization_id || typeof organization_id !== "string") &&
+      (!charity_id || typeof charity_id !== "string")
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Missing organization_id or legacy charity_id" });
     }
     if (!userId || !userEmail) {
       return res.status(400).json({ error: "Missing authenticated user email" });
@@ -1522,7 +1629,9 @@ app.get("/web/create-checkout-session", authRequired, async (req, res) => {
         }
       ],
       metadata: {
-        charity_id,
+        organization_id: normalizeOptionalUuid(organization_id) || "",
+        campaign_id: normalizeOptionalUuid(campaign_id) || "",
+        charity_id: typeof charity_id === "string" ? charity_id : "",
         user_id: userId,
         email: userEmail
       }
@@ -1548,6 +1657,8 @@ app.get("/donations", authRequired, async (req, res) => {
         id,
         amount_cents,
         currency,
+        organization_id AS "organizationId",
+        campaign_id AS "campaignId",
         charity_id AS "charityId",
         charity_name AS "charityName",
         user_id AS "donorId",
@@ -1581,6 +1692,8 @@ app.get("/receipts", authRequired, async (req, res) => {
         r.tax_deductible AS "taxDeductible",
         d.amount_cents AS "amount_cents",
         d.currency,
+        d.organization_id AS "organizationId",
+        d.campaign_id AS "campaignId",
         d.charity_id AS "charityId",
         d.user_id AS "userId",
         d.stripe_payment_intent_id AS "paymentIntentId"
