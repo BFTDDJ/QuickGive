@@ -1,7 +1,7 @@
 require("./instrument");
 require("dotenv").config();
 const db = require("./db");
-const { randomUUID } = require("crypto");
+const { randomUUID, createHmac, timingSafeEqual } = require("crypto");
 const { supabase } = require("./supabase");
 const express = require("express");
 const cors = require("cors");
@@ -224,8 +224,19 @@ async function initSchoolCommunitySchema() {
       city text,
       state text,
       kind text,
+      mascot text,
+      about text,
+      featured_rank integer DEFAULT 0,
       created_at timestamptz DEFAULT now()
     )
+    `
+  );
+  await db.query(
+    `
+    ALTER TABLE schools
+      ADD COLUMN IF NOT EXISTS mascot text,
+      ADD COLUMN IF NOT EXISTS about text,
+      ADD COLUMN IF NOT EXISTS featured_rank integer DEFAULT 0
     `
   );
   await db.query(
@@ -255,6 +266,82 @@ async function initSchoolCommunitySchema() {
   );
   await db.query(
     `
+    CREATE TABLE IF NOT EXISTS school_news (
+      id uuid PRIMARY KEY,
+      school_id uuid NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+      organization_id uuid REFERENCES organizations(id) ON DELETE SET NULL,
+      title text NOT NULL,
+      summary text NOT NULL,
+      category text,
+      is_public boolean DEFAULT true,
+      published_at timestamptz DEFAULT now(),
+      created_at timestamptz DEFAULT now()
+    )
+    `
+  );
+  await db.query(
+    `
+    CREATE TABLE IF NOT EXISTS events (
+      id uuid PRIMARY KEY,
+      school_id uuid NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+      organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      campaign_id uuid REFERENCES campaigns(id) ON DELETE SET NULL,
+      name text NOT NULL,
+      team_name text,
+      opponent text,
+      location text,
+      start_at timestamptz NOT NULL,
+      end_at timestamptz,
+      visibility text DEFAULT 'public',
+      category text,
+      details text,
+      qr_code_value text,
+      suggested_amounts_json jsonb DEFAULT '[]'::jsonb,
+      is_active boolean DEFAULT true,
+      created_at timestamptz DEFAULT now()
+    )
+    `
+  );
+  await db.query(
+    `
+    CREATE TABLE IF NOT EXISTS favorite_schools (
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      school_id uuid NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+      created_at timestamptz DEFAULT now(),
+      PRIMARY KEY (user_id, school_id)
+    )
+    `
+  );
+  await db.query(
+    `
+    CREATE TABLE IF NOT EXISTS school_relationships (
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      school_id uuid NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+      relationship text NOT NULL,
+      created_at timestamptz DEFAULT now(),
+      updated_at timestamptz DEFAULT now(),
+      PRIMARY KEY (user_id, school_id)
+    )
+    `
+  );
+  await db.query(
+    `
+    CREATE TABLE IF NOT EXISTS school_access_memberships (
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      school_id uuid NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+      access_role text NOT NULL,
+      status text NOT NULL DEFAULT 'pending',
+      requested_at timestamptz DEFAULT now(),
+      approved_at timestamptz,
+      updated_at timestamptz DEFAULT now(),
+      approved_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+      notes text,
+      PRIMARY KEY (user_id, school_id, access_role)
+    )
+    `
+  );
+  await db.query(
+    `
     ALTER TABLE donations
       ADD COLUMN IF NOT EXISTS organization_id uuid,
       ADD COLUMN IF NOT EXISTS campaign_id uuid
@@ -267,6 +354,12 @@ async function initSchoolCommunitySchema() {
       ADD COLUMN IF NOT EXISTS campaign_id uuid
     `
   );
+  await db.query(`CREATE INDEX IF NOT EXISTS organizations_school_id_idx ON organizations (school_id)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS campaigns_organization_id_idx ON campaigns (organization_id)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS school_news_school_id_idx ON school_news (school_id, published_at DESC)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS events_school_id_idx ON events (school_id, start_at ASC)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS favorite_schools_school_id_idx ON favorite_schools (school_id)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS school_access_memberships_school_id_idx ON school_access_memberships (school_id, access_role, status)`);
 }
 
 initSchoolCommunitySchema().catch((err) => {
@@ -281,6 +374,115 @@ function normalizeOptionalUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimmed)
     ? trimmed
     : null;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value !== "string") {
+    return fallback;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "yes"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "no"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function normalizeRelationship(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  return ["student", "alumni", "parent", "supporter"].includes(normalized)
+    ? normalized
+    : null;
+}
+
+function normalizeEventVisibility(value) {
+  if (typeof value !== "string") {
+    return "public";
+  }
+  const normalized = value.trim().toLowerCase();
+  return ["public", "parents", "all"].includes(normalized)
+    ? normalized
+    : "public";
+}
+
+function normalizeAccessStatus(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  return ["pending", "approved", "revoked"].includes(normalized)
+    ? normalized
+    : null;
+}
+
+function getEventQrSecret() {
+  return process.env.EVENT_QR_SECRET || process.env.JWT_SECRET_CURRENT;
+}
+
+function toBase64Url(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function fromBase64Url(value) {
+  return Buffer.from(value, "base64url").toString("utf8");
+}
+
+function signEventQrPayload(encodedPayload) {
+  return createHmac("sha256", getEventQrSecret()).update(encodedPayload).digest("base64url");
+}
+
+function buildEventQrToken(event) {
+  const expiresAt = new Date(
+    Math.max(
+      new Date(event.end_at || event.start_at).getTime(),
+      Date.now()
+    ) + 1000 * 60 * 60 * 24 * 30
+  ).toISOString();
+
+  const payload = {
+    eventId: event.id,
+    schoolId: event.school_id,
+    organizationId: event.organization_id,
+    campaignId: event.campaign_id || null,
+    legacyCharityId: event.organization_id,
+    expiresAt
+  };
+
+  const encodedPayload = toBase64Url(JSON.stringify(payload));
+  const signature = signEventQrPayload(encodedPayload);
+  return `${encodedPayload}.${signature}`;
+}
+
+function verifyEventQrToken(token) {
+  if (typeof token !== "string" || !token.includes(".")) {
+    throw new Error("Invalid QR token");
+  }
+  const [encodedPayload, signature] = token.split(".", 2);
+  const expectedSignature = signEventQrPayload(encodedPayload);
+  const provided = Buffer.from(signature);
+  const expected = Buffer.from(expectedSignature);
+  if (
+    provided.length !== expected.length ||
+    !timingSafeEqual(provided, expected)
+  ) {
+    throw new Error("Invalid QR token signature");
+  }
+  const payload = JSON.parse(fromBase64Url(encodedPayload));
+  if (!payload?.eventId || !payload?.organizationId || !payload?.schoolId) {
+    throw new Error("Invalid QR token payload");
+  }
+  if (payload.expiresAt && new Date(payload.expiresAt) < new Date()) {
+    throw new Error("QR token expired");
+  }
+  return payload;
 }
 
 function signToken(userId, email) {
@@ -329,6 +531,22 @@ function authOptional(req, res, next) {
     req.user = { id: payload.sub, email: payload.email };
   } catch (err) {
     console.error("JWT VERIFY FAILED:", err);
+  }
+  return next();
+}
+
+function requireAccessAdmin(req, res, next) {
+  const token = req.headers["x-access-admin-token"];
+  if (!process.env.EVENT_ACCESS_ADMIN_TOKEN) {
+    logError("ACCESS ADMIN TOKEN MISSING", { request_id: req.id });
+    return res.status(503).json({ error: "Access approval unavailable" });
+  }
+  if (!token || token !== process.env.EVENT_ACCESS_ADMIN_TOKEN) {
+    logError("ACCESS ADMIN AUTH FAILURE", {
+      request_id: req.id,
+      authorization_present: Boolean(token)
+    });
+    return res.status(401).json({ error: "Invalid admin token" });
   }
   return next();
 }
@@ -930,6 +1148,934 @@ app.get("/ready", async (req, res) => {
       },
       timestamp: new Date().toISOString()
     });
+  }
+});
+
+app.get("/schools/recommended", authOptional, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 6, 25);
+    const params = [req.user?.id || null, limit];
+    const { rows } = await db.query(
+      `
+      SELECT
+        s.id,
+        s.name,
+        s.city,
+        s.state,
+        s.kind,
+        s.mascot,
+        s.about,
+        s.featured_rank AS "featuredRank",
+        CASE WHEN fs.user_id IS NULL THEN false ELSE true END AS "isFavorite",
+        sr.relationship AS relationship,
+        sam.status AS "parentAccessStatus",
+        COUNT(DISTINCT o.id)::int AS "organizationCount",
+        COUNT(DISTINCT CASE WHEN e.is_active IS TRUE AND e.start_at >= now() THEN e.id END)::int AS "upcomingEventCount"
+      FROM schools s
+      LEFT JOIN organizations o ON o.school_id = s.id
+      LEFT JOIN events e ON e.school_id = s.id
+      LEFT JOIN favorite_schools fs ON fs.school_id = s.id AND fs.user_id = $1
+      LEFT JOIN school_relationships sr ON sr.school_id = s.id AND sr.user_id = $1
+      LEFT JOIN school_access_memberships sam
+        ON sam.school_id = s.id
+       AND sam.user_id = $1
+       AND sam.access_role = 'parent_guardian'
+      GROUP BY s.id, fs.user_id, sr.relationship, sam.status
+      ORDER BY
+        CASE WHEN fs.user_id IS NULL THEN 1 ELSE 0 END,
+        CASE sr.relationship
+          WHEN 'student' THEN 0
+          WHEN 'parent' THEN 1
+          WHEN 'alumni' THEN 2
+          WHEN 'supporter' THEN 3
+          ELSE 4
+        END,
+        s.featured_rank ASC,
+        s.name ASC
+      LIMIT $2
+      `,
+      params
+    );
+
+    return res.json(rows);
+  } catch (err) {
+    logError("RECOMMENDED SCHOOLS FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/events", authOptional, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.query.school_id);
+    const organizationId = normalizeOptionalUuid(req.query.organization_id);
+    const campaignId = normalizeOptionalUuid(req.query.campaign_id);
+    const visibility = normalizeEventVisibility(req.query.visibility);
+    const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
+    const favoritesOnly = parseBoolean(req.query.favorites_only, false);
+    const includePast = parseBoolean(req.query.include_past, false);
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+
+    const params = [req.user?.id || null];
+    const where = ["e.is_active IS TRUE"];
+
+    if (!includePast) {
+      where.push("COALESCE(e.end_at, e.start_at) >= now()");
+    }
+    if (schoolId) {
+      params.push(schoolId);
+      where.push(`e.school_id = $${params.length}`);
+    }
+    if (organizationId) {
+      params.push(organizationId);
+      where.push(`e.organization_id = $${params.length}`);
+    }
+    if (campaignId) {
+      params.push(campaignId);
+      where.push(`e.campaign_id = $${params.length}`);
+    }
+    if (visibility === "public") {
+      where.push("e.visibility = 'public'");
+    } else if (visibility === "parents") {
+      where.push("e.visibility = 'parents'");
+      where.push("sam.user_id IS NOT NULL");
+    } else {
+      where.push("(e.visibility = 'public' OR (e.visibility = 'parents' AND sam.user_id IS NOT NULL))");
+    }
+    if (category) {
+      params.push(category);
+      where.push(`e.category = $${params.length}`);
+    }
+    if (favoritesOnly && req.user?.id) {
+      where.push("fs.user_id IS NOT NULL");
+    }
+
+    params.push(limit);
+    const { rows } = await db.query(
+      `
+      SELECT
+        e.id,
+        e.school_id AS "schoolId",
+        e.organization_id AS "organizationId",
+        e.campaign_id AS "campaignId",
+        e.name,
+        e.team_name AS "teamName",
+        e.opponent,
+        e.location,
+        e.start_at AS "startAt",
+        e.end_at AS "endAt",
+        e.visibility,
+        e.category,
+        e.details,
+        COALESCE(e.qr_code_value, '') AS "storedQrCodeValue",
+        COALESCE(e.suggested_amounts_json, '[]'::jsonb) AS "suggestedAmounts",
+        s.name AS "schoolName",
+        o.name AS "organizationName",
+        CASE WHEN fs.user_id IS NULL THEN false ELSE true END AS "isFavoriteSchool",
+        CASE WHEN sam.user_id IS NULL THEN false ELSE true END AS "hasParentAccess"
+      FROM events e
+      JOIN schools s ON s.id = e.school_id
+      JOIN organizations o ON o.id = e.organization_id
+      LEFT JOIN favorite_schools fs ON fs.school_id = e.school_id AND fs.user_id = $1
+      LEFT JOIN school_access_memberships sam
+        ON sam.school_id = e.school_id
+       AND sam.user_id = $1
+       AND sam.access_role = 'parent_guardian'
+       AND sam.status = 'approved'
+      WHERE ${where.join(" AND ")}
+      ORDER BY
+        CASE WHEN fs.user_id IS NULL THEN 1 ELSE 0 END,
+        e.start_at ASC
+      LIMIT $${params.length}
+      `,
+      params
+    );
+
+    return res.json(
+      rows.map((row) => {
+        const qrCodeValue =
+          row.storedQrCodeValue && row.storedQrCodeValue.trim().length > 0
+            ? row.storedQrCodeValue
+            : `https://quickgive.com/event-support?token=${buildEventQrToken({
+                id: row.id,
+                school_id: row.schoolId,
+                organization_id: row.organizationId,
+                campaign_id: row.campaignId,
+                start_at: row.startAt,
+                end_at: row.endAt
+              })}`;
+        return {
+          ...row,
+          qrCodeValue
+        };
+      })
+    );
+  } catch (err) {
+    logError("EVENTS FEED FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/schools", authOptional, async (req, res) => {
+  try {
+    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    const favoritesOnly = parseBoolean(req.query.favorites_only, false);
+    const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100);
+
+    const params = [req.user?.id || null];
+    let sql = `
+      SELECT
+        s.id,
+        s.name,
+        s.city,
+        s.state,
+        s.kind,
+        s.mascot,
+        s.about,
+        s.featured_rank AS "featuredRank",
+        COUNT(DISTINCT o.id)::int AS "organizationCount",
+        COUNT(DISTINCT CASE WHEN e.is_active IS TRUE AND e.start_at >= now() THEN e.id END)::int AS "upcomingEventCount",
+        CASE WHEN fs.user_id IS NULL THEN false ELSE true END AS "isFavorite",
+        sr.relationship AS relationship,
+        sam.status AS "parentAccessStatus"
+      FROM schools s
+      LEFT JOIN organizations o ON o.school_id = s.id
+      LEFT JOIN events e ON e.school_id = s.id
+      LEFT JOIN favorite_schools fs ON fs.school_id = s.id AND fs.user_id = $1
+      LEFT JOIN school_relationships sr ON sr.school_id = s.id AND sr.user_id = $1
+      LEFT JOIN school_access_memberships sam
+        ON sam.school_id = s.id
+       AND sam.user_id = $1
+       AND sam.access_role = 'parent_guardian'
+    `;
+
+    const where = [];
+    if (q) {
+      params.push(`%${q}%`);
+      where.push(`(s.name ILIKE $${params.length} OR s.city ILIKE $${params.length} OR COALESCE(s.mascot, '') ILIKE $${params.length})`);
+    }
+    if (favoritesOnly && req.user?.id) {
+      where.push(`fs.user_id IS NOT NULL`);
+    }
+    if (where.length > 0) {
+      sql += ` WHERE ${where.join(" AND ")}`;
+    }
+
+    params.push(limit);
+    sql += `
+      GROUP BY s.id, fs.user_id, sr.relationship
+      , sam.status
+      ORDER BY
+        CASE WHEN fs.user_id IS NULL THEN 1 ELSE 0 END,
+        s.featured_rank ASC,
+        s.name ASC
+      LIMIT $${params.length}
+    `;
+
+    const { rows } = await db.query(sql, params);
+    return res.json(rows);
+  } catch (err) {
+    logError("SCHOOLS FETCH FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/schools/:id", authOptional, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.params.id);
+    if (!schoolId) {
+      return res.status(400).json({ error: "Invalid school id" });
+    }
+
+    const schoolResult = await db.query(
+      `
+      SELECT
+        s.id,
+        s.name,
+        s.city,
+        s.state,
+        s.kind,
+        s.mascot,
+        s.about,
+        s.featured_rank AS "featuredRank",
+        CASE WHEN fs.user_id IS NULL THEN false ELSE true END AS "isFavorite",
+        sr.relationship AS relationship,
+        sam.status AS "parentAccessStatus"
+      FROM schools s
+      LEFT JOIN favorite_schools fs ON fs.school_id = s.id AND fs.user_id = $2
+      LEFT JOIN school_relationships sr ON sr.school_id = s.id AND sr.user_id = $2
+      LEFT JOIN school_access_memberships sam
+        ON sam.school_id = s.id
+       AND sam.user_id = $2
+       AND sam.access_role = 'parent_guardian'
+      WHERE s.id = $1
+      LIMIT 1
+      `,
+      [schoolId, req.user?.id || null]
+    );
+
+    const school = schoolResult.rows[0];
+    if (!school) {
+      return res.status(404).json({ error: "School not found" });
+    }
+
+    const organizationsResult = await db.query(
+      `
+      SELECT
+        o.id,
+        o.school_id AS "schoolId",
+        o.name,
+        o.category,
+        o.description,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id', c.id,
+              'name', c.name,
+              'description', c.description,
+              'goalAmountCents', c.goal_amount_cents,
+              'isActive', c.is_active
+            )
+            ORDER BY c.created_at DESC
+          ) FILTER (WHERE c.id IS NOT NULL),
+          '[]'::json
+        ) AS campaigns
+      FROM organizations o
+      LEFT JOIN campaigns c ON c.organization_id = o.id
+      WHERE o.school_id = $1
+      GROUP BY o.id
+      ORDER BY o.name ASC
+      `,
+      [schoolId]
+    );
+
+    const eventsResult = await db.query(
+      `
+      SELECT
+        e.id,
+        e.school_id AS "schoolId",
+        e.organization_id AS "organizationId",
+        e.campaign_id AS "campaignId",
+        e.name,
+        e.team_name AS "teamName",
+        e.opponent,
+        e.location,
+        e.start_at AS "startAt",
+        e.end_at AS "endAt",
+        e.visibility,
+        e.category,
+        e.details,
+        COALESCE(e.qr_code_value, '') AS "storedQrCodeValue",
+        COALESCE(e.suggested_amounts_json, '[]'::jsonb) AS "suggestedAmounts",
+        CASE WHEN sam.user_id IS NULL THEN false ELSE true END AS "hasParentAccess"
+      FROM events e
+      LEFT JOIN school_access_memberships sam
+        ON sam.school_id = e.school_id
+       AND sam.user_id = $2
+       AND sam.access_role = 'parent_guardian'
+       AND sam.status = 'approved'
+      WHERE e.school_id = $1
+        AND e.is_active IS TRUE
+        AND e.start_at >= now()
+        AND (e.visibility = 'public' OR (e.visibility = 'parents' AND sam.user_id IS NOT NULL))
+      ORDER BY e.start_at ASC
+      LIMIT 5
+      `,
+      [schoolId, req.user?.id || null]
+    );
+
+    const mappedEvents = eventsResult.rows.map((row) => ({
+      ...row,
+      qrCodeValue:
+        row.storedQrCodeValue && row.storedQrCodeValue.trim().length > 0
+          ? row.storedQrCodeValue
+          : `https://quickgive.com/event-support?token=${buildEventQrToken({
+              id: row.id,
+              school_id: row.schoolId,
+              organization_id: row.organizationId,
+              campaign_id: row.campaignId,
+              start_at: row.startAt,
+              end_at: row.endAt
+            })}`
+    }));
+
+    return res.json({
+      ...school,
+      organizations: organizationsResult.rows,
+      events: mappedEvents
+    });
+  } catch (err) {
+    logError("SCHOOL DETAIL FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/schools/:id/events", authOptional, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.params.id);
+    if (!schoolId) {
+      return res.status(400).json({ error: "Invalid school id" });
+    }
+
+    const visibility = normalizeEventVisibility(req.query.visibility);
+    const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
+    const includePast = parseBoolean(req.query.include_past, false);
+    const params = [schoolId, req.user?.id || null];
+    const where = ["e.school_id = $1", "e.is_active IS TRUE"];
+
+    if (!includePast) {
+      where.push("COALESCE(e.end_at, e.start_at) >= now()");
+    }
+    if (visibility === "public") {
+      where.push("e.visibility = 'public'");
+    } else if (visibility === "parents") {
+      where.push("e.visibility = 'parents'");
+      where.push("sam.user_id IS NOT NULL");
+    } else {
+      where.push("(e.visibility = 'public' OR (e.visibility = 'parents' AND sam.user_id IS NOT NULL))");
+    }
+    if (category) {
+      params.push(category);
+      where.push(`e.category = $${params.length}`);
+    }
+
+    const { rows } = await db.query(
+      `
+      SELECT
+        e.id,
+        e.school_id AS "schoolId",
+        e.organization_id AS "organizationId",
+        e.campaign_id AS "campaignId",
+        e.name,
+        e.team_name AS "teamName",
+        e.opponent,
+        e.location,
+        e.start_at AS "startAt",
+        e.end_at AS "endAt",
+        e.visibility,
+        e.category,
+        e.details,
+        COALESCE(e.qr_code_value, '') AS "storedQrCodeValue",
+        COALESCE(e.suggested_amounts_json, '[]'::jsonb) AS "suggestedAmounts",
+        o.name AS "organizationName",
+        CASE WHEN sam.user_id IS NULL THEN false ELSE true END AS "hasParentAccess"
+      FROM events e
+      JOIN organizations o ON o.id = e.organization_id
+      LEFT JOIN school_access_memberships sam
+        ON sam.school_id = e.school_id
+       AND sam.user_id = $2
+       AND sam.access_role = 'parent_guardian'
+       AND sam.status = 'approved'
+      WHERE ${where.join(" AND ")}
+      ORDER BY e.start_at ASC
+      `,
+      params
+    );
+
+    return res.json(
+      rows.map((row) => ({
+        ...row,
+        qrCodeValue:
+          row.storedQrCodeValue && row.storedQrCodeValue.trim().length > 0
+            ? row.storedQrCodeValue
+            : `https://quickgive.com/event-support?token=${buildEventQrToken({
+                id: row.id,
+                school_id: row.schoolId,
+                organization_id: row.organizationId,
+                campaign_id: row.campaignId,
+                start_at: row.startAt,
+                end_at: row.endAt
+              })}`
+      }))
+    );
+  } catch (err) {
+    logError("SCHOOL EVENTS FETCH FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/events/resolve-qr", authOptional, async (req, res) => {
+  try {
+    const token = typeof req.query.token === "string" ? req.query.token.trim() : "";
+    if (!token) {
+      return res.status(400).json({ error: "Missing token" });
+    }
+
+    const payload = verifyEventQrToken(token);
+    const { rows } = await db.query(
+      `
+      SELECT
+        e.id,
+        e.school_id AS "schoolId",
+        e.organization_id AS "organizationId",
+        e.campaign_id AS "campaignId",
+        e.name,
+        e.team_name AS "teamName",
+        e.opponent,
+        e.location,
+        e.start_at AS "startAt",
+        e.end_at AS "endAt",
+        e.visibility,
+        e.category,
+        e.details,
+        COALESCE(e.suggested_amounts_json, '[]'::jsonb) AS "suggestedAmounts",
+        s.name AS "schoolName",
+        o.name AS "organizationName"
+      FROM events e
+      JOIN schools s ON s.id = e.school_id
+      JOIN organizations o ON o.id = e.organization_id
+      LEFT JOIN school_access_memberships sam
+        ON sam.school_id = e.school_id
+       AND sam.user_id = $2
+       AND sam.access_role = 'parent_guardian'
+       AND sam.status = 'approved'
+      WHERE e.id = $1
+        AND e.is_active IS TRUE
+        AND (e.visibility = 'public' OR (e.visibility = 'parents' AND sam.user_id IS NOT NULL))
+      LIMIT 1
+      `,
+      [payload.eventId, req.user?.id || null]
+    );
+
+    const event = rows[0];
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    return res.json({
+      event,
+      donationTarget: {
+        organizationId: event.organizationId,
+        campaignId: event.campaignId,
+        legacyCharityId: payload.legacyCharityId || event.organizationId
+      },
+      token
+    });
+  } catch (err) {
+    logError("EVENT QR RESOLVE FAILED", { request_id: req.id, error: err.message });
+    return res.status(400).json({ error: "Invalid or expired token" });
+  }
+});
+
+app.get("/news", authOptional, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.query.school_id);
+    const favoriteOnly = parseBoolean(req.query.favorite_only, false);
+    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const params = [req.user?.id || null];
+    const where = ["n.is_public IS TRUE"];
+
+    if (schoolId) {
+      params.push(schoolId);
+      where.push(`n.school_id = $${params.length}`);
+    }
+    if (favoriteOnly && req.user?.id) {
+      where.push("fs.user_id IS NOT NULL");
+    }
+
+    params.push(limit);
+    const { rows } = await db.query(
+      `
+      SELECT
+        n.id,
+        n.school_id AS "schoolId",
+        n.organization_id AS "organizationId",
+        n.title,
+        n.summary,
+        n.category,
+        n.published_at AS "publishedAt",
+        s.name AS "schoolName",
+        CASE WHEN fs.user_id IS NULL THEN false ELSE true END AS "isFavoriteSchool"
+      FROM school_news n
+      JOIN schools s ON s.id = n.school_id
+      LEFT JOIN favorite_schools fs ON fs.school_id = n.school_id AND fs.user_id = $1
+      WHERE ${where.join(" AND ")}
+      ORDER BY n.published_at DESC
+      LIMIT $${params.length}
+      `,
+      params
+    );
+
+    return res.json(rows);
+  } catch (err) {
+    logError("NEWS FETCH FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/me/schools/favorites", authRequired, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `
+      SELECT
+        s.id,
+        s.name,
+        s.city,
+        s.state,
+        s.kind,
+        s.mascot,
+        s.about,
+        fs.created_at AS "favoritedAt"
+      FROM favorite_schools fs
+      JOIN schools s ON s.id = fs.school_id
+      WHERE fs.user_id = $1
+      ORDER BY fs.created_at DESC
+      `,
+      [req.user.id]
+    );
+    return res.json(rows);
+  } catch (err) {
+    logError("FAVORITE SCHOOLS FETCH FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/me/schools/:id/favorite", authRequired, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.params.id);
+    if (!schoolId) {
+      return res.status(400).json({ error: "Invalid school id" });
+    }
+
+    await db.query(
+      `
+      INSERT INTO favorite_schools (user_id, school_id)
+      VALUES ($1, $2)
+      ON CONFLICT (user_id, school_id) DO NOTHING
+      `,
+      [req.user.id, schoolId]
+    );
+
+    return res.json({ ok: true, schoolId, isFavorite: true });
+  } catch (err) {
+    logError("FAVORITE SCHOOL SAVE FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/me/schools/:id/favorite", authRequired, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.params.id);
+    if (!schoolId) {
+      return res.status(400).json({ error: "Invalid school id" });
+    }
+
+    await db.query(
+      `DELETE FROM favorite_schools WHERE user_id = $1 AND school_id = $2`,
+      [req.user.id, schoolId]
+    );
+
+    return res.json({ ok: true, schoolId, isFavorite: false });
+  } catch (err) {
+    logError("FAVORITE SCHOOL DELETE FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/me/schools/relationships", authRequired, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `
+      SELECT school_id AS "schoolId", relationship, updated_at AS "updatedAt"
+      FROM school_relationships
+      WHERE user_id = $1
+      ORDER BY updated_at DESC
+      `,
+      [req.user.id]
+    );
+    return res.json(rows);
+  } catch (err) {
+    logError("SCHOOL RELATIONSHIPS FETCH FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/me/schools/access", authRequired, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `
+      SELECT
+        school_id AS "schoolId",
+        access_role AS "accessRole",
+        status,
+        requested_at AS "requestedAt",
+        approved_at AS "approvedAt",
+        updated_at AS "updatedAt",
+        notes
+      FROM school_access_memberships
+      WHERE user_id = $1
+      ORDER BY updated_at DESC
+      `,
+      [req.user.id]
+    );
+    return res.json(rows);
+  } catch (err) {
+    logError("SCHOOL ACCESS FETCH FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/me/schools/:id/parent-access", authRequired, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.params.id);
+    if (!schoolId) {
+      return res.status(400).json({ error: "Invalid school id" });
+    }
+
+    const { rows } = await db.query(
+      `
+      SELECT
+        school_id AS "schoolId",
+        access_role AS "accessRole",
+        status,
+        requested_at AS "requestedAt",
+        approved_at AS "approvedAt",
+        updated_at AS "updatedAt",
+        notes
+      FROM school_access_memberships
+      WHERE user_id = $1
+        AND school_id = $2
+        AND access_role = 'parent_guardian'
+      LIMIT 1
+      `,
+      [req.user.id, schoolId]
+    );
+
+    return res.json(
+      rows[0] || {
+        schoolId,
+        accessRole: "parent_guardian",
+        status: "none",
+        requestedAt: null,
+        approvedAt: null,
+        updatedAt: null,
+        notes: null
+      }
+    );
+  } catch (err) {
+    logError("PARENT ACCESS STATUS FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/me/schools/:id/parent-access/request", authRequired, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.params.id);
+    const notes = typeof req.body?.notes === "string" ? req.body.notes.trim().slice(0, 500) : null;
+    if (!schoolId) {
+      return res.status(400).json({ error: "Invalid school id" });
+    }
+
+    const schoolCheck = await db.query(`SELECT id FROM schools WHERE id = $1 LIMIT 1`, [schoolId]);
+    if (schoolCheck.rowCount === 0) {
+      return res.status(404).json({ error: "School not found" });
+    }
+
+    await db.query(
+      `
+      INSERT INTO school_relationships (user_id, school_id, relationship, updated_at)
+      VALUES ($1, $2, 'parent', now())
+      ON CONFLICT (user_id, school_id)
+      DO UPDATE SET relationship = 'parent', updated_at = now()
+      `,
+      [req.user.id, schoolId]
+    );
+
+    const existing = await db.query(
+      `
+      SELECT status
+      FROM school_access_memberships
+      WHERE user_id = $1
+        AND school_id = $2
+        AND access_role = 'parent_guardian'
+      LIMIT 1
+      `,
+      [req.user.id, schoolId]
+    );
+
+    if (existing.rows[0]?.status === "approved") {
+      return res.json({
+        ok: true,
+        schoolId,
+        accessRole: "parent_guardian",
+        status: "approved"
+      });
+    }
+
+    await db.query(
+      `
+      INSERT INTO school_access_memberships (
+        user_id,
+        school_id,
+        access_role,
+        status,
+        requested_at,
+        approved_at,
+        updated_at,
+        approved_by_user_id,
+        notes
+      )
+      VALUES ($1, $2, 'parent_guardian', 'pending', now(), NULL, now(), NULL, $3)
+      ON CONFLICT (user_id, school_id, access_role)
+      DO UPDATE SET
+        status = 'pending',
+        requested_at = now(),
+        approved_at = NULL,
+        updated_at = now(),
+        approved_by_user_id = NULL,
+        notes = EXCLUDED.notes
+      `,
+      [req.user.id, schoolId, notes]
+    );
+
+    return res.json({
+      ok: true,
+      schoolId,
+      accessRole: "parent_guardian",
+      status: "pending"
+    });
+  } catch (err) {
+    logError("PARENT ACCESS REQUEST FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/me/schools/:id/relationship", authRequired, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.params.id);
+    const relationship = normalizeRelationship(req.body?.relationship);
+    if (!schoolId) {
+      return res.status(400).json({ error: "Invalid school id" });
+    }
+    if (!relationship) {
+      return res.status(400).json({ error: "Invalid relationship" });
+    }
+
+    await db.query(
+      `
+      INSERT INTO school_relationships (user_id, school_id, relationship, updated_at)
+      VALUES ($1, $2, $3, now())
+      ON CONFLICT (user_id, school_id)
+      DO UPDATE SET relationship = EXCLUDED.relationship, updated_at = now()
+      `,
+      [req.user.id, schoolId, relationship]
+    );
+
+    return res.json({ ok: true, schoolId, relationship });
+  } catch (err) {
+    logError("SCHOOL RELATIONSHIP SAVE FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/internal/schools/:id/parent-access/:userId/approve", requireAccessAdmin, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.params.id);
+    const userId = normalizeOptionalUuid(req.params.userId);
+    if (!schoolId || !userId) {
+      return res.status(400).json({ error: "Invalid school or user id" });
+    }
+
+    const notes = typeof req.body?.notes === "string" ? req.body.notes.trim().slice(0, 500) : null;
+    const approvedByUserId = normalizeOptionalUuid(req.body?.approvedByUserId);
+
+    await db.query(
+      `
+      INSERT INTO school_access_memberships (
+        user_id,
+        school_id,
+        access_role,
+        status,
+        requested_at,
+        approved_at,
+        updated_at,
+        approved_by_user_id,
+        notes
+      )
+      VALUES ($1, $2, 'parent_guardian', 'approved', now(), now(), now(), $3, $4)
+      ON CONFLICT (user_id, school_id, access_role)
+      DO UPDATE SET
+        status = 'approved',
+        approved_at = now(),
+        updated_at = now(),
+        approved_by_user_id = $3,
+        notes = COALESCE($4, school_access_memberships.notes)
+      `,
+      [userId, schoolId, approvedByUserId, notes]
+    );
+
+    await db.query(
+      `
+      INSERT INTO school_relationships (user_id, school_id, relationship, updated_at)
+      VALUES ($1, $2, 'parent', now())
+      ON CONFLICT (user_id, school_id)
+      DO UPDATE SET relationship = 'parent', updated_at = now()
+      `,
+      [userId, schoolId]
+    );
+
+    return res.json({
+      ok: true,
+      schoolId,
+      userId,
+      accessRole: "parent_guardian",
+      status: "approved"
+    });
+  } catch (err) {
+    logError("PARENT ACCESS APPROVE FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/internal/schools/:id/parent-access/:userId/revoke", requireAccessAdmin, async (req, res) => {
+  try {
+    const schoolId = normalizeOptionalUuid(req.params.id);
+    const userId = normalizeOptionalUuid(req.params.userId);
+    const status = normalizeAccessStatus(req.body?.status) || "revoked";
+    if (!schoolId || !userId) {
+      return res.status(400).json({ error: "Invalid school or user id" });
+    }
+    if (!["pending", "revoked"].includes(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
+
+    const notes = typeof req.body?.notes === "string" ? req.body.notes.trim().slice(0, 500) : null;
+    const approvedByUserId = normalizeOptionalUuid(req.body?.approvedByUserId);
+
+    await db.query(
+      `
+      INSERT INTO school_access_memberships (
+        user_id,
+        school_id,
+        access_role,
+        status,
+        requested_at,
+        approved_at,
+        updated_at,
+        approved_by_user_id,
+        notes
+      )
+      VALUES ($1, $2, 'parent_guardian', $3, now(), NULL, now(), $4, $5)
+      ON CONFLICT (user_id, school_id, access_role)
+      DO UPDATE SET
+        status = $3,
+        approved_at = NULL,
+        updated_at = now(),
+        approved_by_user_id = $4,
+        notes = COALESCE($5, school_access_memberships.notes)
+      `,
+      [userId, schoolId, status, approvedByUserId, notes]
+    );
+
+    return res.json({
+      ok: true,
+      schoolId,
+      userId,
+      accessRole: "parent_guardian",
+      status
+    });
+  } catch (err) {
+    logError("PARENT ACCESS REVOKE FAILED", { request_id: req.id, error: err.message });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
